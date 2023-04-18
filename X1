@@ -1,0 +1,2477 @@
+import gzip
+import json
+import socket
+
+from codecs import getdecoder
+from csv import reader
+from os import path, remove, rename, environ, getpid, stat, mkdir, walk
+from shutil import copy
+from string import hexdigits
+from subprocess import call
+from sys import exit, argv
+from time import ctime, mktime, strftime, strptime, time
+import numpy as np
+import numba
+
+#class AppMutex:
+    #"""
+    #Class serves as single instance mutex handler (My application can be run only once).
+    #It use OS default property where single UDP port can be bind only once at time.
+    #"""
+
+    #@staticmethod
+    #def enable():
+        #"""
+        #By calling this you bind UDP connection on specified port.
+        #If binding fails then port is already opened from somewhere else.
+        #"""
+       #try:
+            #AppMutex.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # UDP
+            #AppMutex.sock.bind(("127.0.0.1", 40000))
+        #except OSError:
+            #raise Exception("Application can be run only once.")
+            #exit(0)
+        #except socket.error as e:
+            #print(f"{strftime('%Y-%m-%d %H:%M:%S')}: Quit as the tool ({argv[0]}) is already in use ({e})")
+            #exit(0)
+
+
+class ErrorRaised(Exception):
+       pass
+
+
+class RCF:
+    # def __init__(self, json_file=f"{environ['HOME']}/etc/ccx2npf_cfg.json", write_to=None, rcf=None, ccx_file=None):
+    def __init__(self, json_file="E:/nxp/ccx2npf_cfg.json", write_to=None,
+                 rcf=None, ccx_file=None):
+        self.config_file = json_file
+        self.tmpl_ok = True
+
+        try:
+            with open(self.config_file, 'r', buffering=2**21) as cfg_file:
+                self.data = json.load(cfg_file)
+        except IOError as e:
+            if path.basename(self.config_file) == "ccx2npf_cfg.json":
+                print(e)
+                exit(2)
+            else:
+                message = f"{e}. moving {path.basename(ccx_file)} to ERROR."
+                write_to.write_status_log_file(message)
+                write_to.close_status_log_file()
+                # moving CCx to Error
+                error_dir = f"{rcf.read_config_file('inputLogLocation')}/{rcf.read_config_file('error_log')}"
+                rename(ccx_file, f"{error_dir}/{path.basename(ccx_file)}")
+                self.tmpl_ok = False
+    
+    def read_config_file(self, *args):
+        if len(args) == 0:
+            return self.data
+        if len(args) == 1:
+            return self.data[args[0]]
+        elif len(args) == 2:
+            return self.data[args[0]][args[1]]
+        elif len(args) == 3:
+            return self.data[args[0]][args[1]][args[2]]
+        elif len(args) == 4:
+            return self.data[args[0]][args[1]][args[2]][args[3]]
+        elif len(args) == 5:
+            return self.data[args[0]][args[1]][args[2]][args[3]][args[4]]
+
+
+class WriteConvertLogFiles:
+    def __init__(self, ccx_filename):
+        self.RCF = RCF()
+        self.ConvertingLog = f"{self.RCF.read_config_file('converting_log')}{strftime('%Y%m%d')}"  # year month day
+        self.CCxLog = f"{self.RCF.read_config_file('inputLogLocation')}" \
+            f"/{self.RCF.read_config_file('ccx_log')}" \
+            f"{ strftime('%y%V')}"  # year week(ISO)
+        self.ErrorLog = f"{self.RCF.read_config_file('inputLogLocation')}" \
+            f"/{self.RCF.read_config_file('error_log')}" \
+            f"/{path.basename(ccx_filename)}.err"
+
+        self.ConvertingLogFile = open(self.ConvertingLog, 'a')
+        message = f"--> Start converting {ccx_filename}"
+        self.write_data_to_convert_log_file(message)
+
+    def create_error_log_file(self):
+        self.ErrorLogFile = open(self.ErrorLog, 'a')
+
+    def close_error_log_file(self):
+        self.ErrorLogFile.close()
+
+    def write_error_log_file(self, message):
+        message2write = f"{strftime('%Y-%m-%d %H:%M:%S')} ccx converting({socket.getfqdn()}:{str(getpid())}) " \
+            f"{message}\n"
+
+        self.ErrorLogFile.write(message2write)
+
+    def create_status_log_file(self):
+        self.StatusLogFile = open(self.CCxLog, 'a')
+
+    def close_status_log_file(self):
+        self.StatusLogFile.close()
+
+    def write_status_log_file(self, message):
+        message2write = f"{strftime('%Y-%m-%d %H:%M:%S')} ccx converting({socket.getfqdn()}:{getpid()}) " \
+            f"{message}\n"
+        self.StatusLogFile.write(message2write)
+
+    def write_data_to_convert_log_file(self, message):
+        message2write = f"{strftime('%Y-%m-%d %H:%M:%S')} ccx converting({socket.getfqdn()}:{getpid()}) " \
+            f"{message}\n"
+        self.ConvertingLogFile.write(message2write)
+
+    def close_convert_log_file(self):
+        message = "EXIT: Finished"
+        self.write_data_to_convert_log_file(message)
+        self.ConvertingLogFile.close()
+
+    def do_tesla_log(self, lot_id, batch_id, wafer_id, ntf_file, status, error):
+        if not self.RCF.read_config_file("TeslaLog"):
+            return
+
+        # "NTF=$f" "IF=" "STATUS=OK" "LOTID=$LOTID" "WAFERID=$WAFERID" "FILTER=$SOURCETYPE"
+        command = f"tdf2tesla 1 IF=\"\" STATUS=\"{status} \" LOTID=\"{batch_id}\" DIFFLOTID=\"{lot_id}\" " \
+                      f"WAFERID=\"{wafer_id}\" NTF=\"{ntf_file}\" ERROR=\"{error}\" FILTER=\"\""
+        return_value = call(command, shell=True)
+
+
+class WriteNpfFile:
+    def __init__(self, ccx_filename):
+        self.RCF = RCF()
+        self.file_extension_incomplete = self.RCF.read_config_file("file_extension_incomplete")
+        self.file_extension_complete = self.RCF.read_config_file("file_extension_complete")
+        self.npf_file_location = self.RCF.read_config_file("outputLocation")
+        self.npf_temp_file_location = self.RCF.read_config_file("Processing location")
+        self.filename_incomplete = f"{self.npf_temp_file_location}/{path.basename(ccx_filename)}" \
+            f"{self.file_extension_incomplete}"
+        self.filename_complete = f"{self.npf_file_location}/{path.basename(ccx_filename)}" \
+            f"{self.file_extension_complete}"
+
+        self.npfFile = open(self.filename_incomplete, 'w', buffering=2**21)
+        self.result_matrix_final_length_counter = 0
+
+    def write_header_information(self, header_array):
+        string2write = f"%BOH\n" \
+                       f"# NPF Reliability Datalog -> datatype: rpar\n" \
+                       f"# FormatVersion 1.0\n" \
+                       f"# Separator\"|\"\n" \
+                       f"# NPF creation time: {strftime('%Y%m%d_%H%M%S')}\n" \
+                       f"#"
+        i = 0
+        while i < len(header_array):
+            if header_array[i][1] is None:
+                value = "NA"
+            else:
+                value = header_array[i][1]
+            string2write = f"{string2write}\n# {header_array[i][0]}|{value}"
+            i += 1
+
+        string2write = f"{string2write}\n%EOH\n"
+        self.npfFile.write(string2write)
+        return
+
+    def write_result_begin(self):
+        string2write = "%BOR\n"
+        self.npfFile.write(string2write)
+
+    def write_result_header(self, result_matrix):
+        result_matrix[0] = "%HEADER"
+        result_matrix[1] = "dieX"
+        result_matrix[2] = "dieY"
+        result_matrix[3] = "Device_Serial"
+        result_matrix[4] = "FailBin"
+        result_matrix[5] = "BinName"
+        result_matrix[6] = "Pass/Fail"
+        result_matrix[7] = "run_start"
+        result_matrix[8] = "FailSBin"
+        result_matrix[9] = "SBinName"
+        result_matrix[10] = "Board ID"
+        result_matrix[11] = "DriverID"
+
+        string2write = ""
+
+        i = 0
+        while i < len(result_matrix):
+        # for item in result_matrix:
+            if result_matrix[i] != "NA":
+                string2write = f"{string2write}{result_matrix[i]}|"
+                self.result_matrix_final_length_counter += 1
+            i += 1
+
+        string2write = string2write.rstrip("|")
+        string2write = f"{string2write}\n"
+        self.npfFile.write(string2write)
+
+        return self.result_matrix_final_length_counter
+    
+    def write_result_format(self, result_matrix):
+        result_matrix[0] = "%FORMAT"
+        i = 1
+        while i < 8:
+            # for i in range(1, 8):
+            result_matrix[i] = "Index"
+            i += 1
+        while i < 12:
+            # for i in range(8, 12):
+            result_matrix[i] = "NA"
+            i += 1
+
+        string2write = ""
+        i = 0
+        while i < self.result_matrix_final_length_counter:
+            # for i in range(0, self.result_matrix_final_length_counter):
+            if result_matrix[i] is not None:
+                string2write = f"{string2write}{result_matrix[i]}|"
+            i += 1
+
+        string2write = string2write.rstrip("|")
+        string2write = f"{string2write}\n"
+        self.npfFile.write(string2write)
+
+    def write_result_unit(self, result_matrix):
+        result_matrix[0] = "%UNIT"
+
+        i = 1
+        while i<12:
+            # for i in range(1, 12):
+            result_matrix[i] = "-"
+            i += 1
+
+        string2write = ""
+        i = 0
+        while i < self.result_matrix_final_length_counter:
+            # for i in range(0, self.result_matrix_final_length_counter):
+            if result_matrix[i] is not None:
+                string2write = f"{string2write}{result_matrix[i]}|"
+            i += 1
+
+        string2write = string2write.rstrip("|")
+        string2write = f"{string2write}\n"
+        self.npfFile.write(string2write)
+
+    def write_result_min(self, result_matrix):
+        result_matrix[0] = "%MIN"
+        i = 1
+        while i < 12:
+            # for i in range(1, 12):
+            result_matrix[i] = "NA"
+            i += 1
+
+        string2write = ""
+        i = 0
+        while i < self.result_matrix_final_length_counter:
+            # for i in range(0, self.result_matrix_final_length_counter):
+            if result_matrix[i] is not None:
+                string2write = f"{string2write}{result_matrix[i]}|"
+            i += 1
+
+        string2write = string2write.rstrip("|")
+        string2write = f"{string2write}\n"
+        self.npfFile.write(string2write)
+
+    def write_result_max(self, result_matrix):
+        result_matrix[0] = "%MAX"
+        i = 1
+        while i < 12:
+            result_matrix[i] = "NA"
+            i += 1
+
+        string2write = ""
+        for i in range(0, self.result_matrix_final_length_counter):
+            if result_matrix[i] is not None:
+                string2write = f"{string2write}{result_matrix[i]}|"
+
+        string2write = string2write.rstrip("|")
+        string2write = f"{string2write}\n"
+        self.npfFile.write(string2write)
+
+    def write_result_value(self, result_matrix):
+        result_matrix[0] = "%VALUE"
+
+        string2write = ""
+        i = 0
+        while i < self.result_matrix_final_length_counter:
+            string2write = f"{string2write}{result_matrix[i]}|"
+            i += 1
+
+        string2write = string2write.rstrip("|")
+        string2write = f"{string2write}\n"
+        self.npfFile.write(string2write)
+
+    def write_result_end(self):
+        string2write = "%EOR\n"
+        self.npfFile.write(string2write)
+
+    def close_npf_file(self):
+        self.npfFile.close()
+        try:
+            # rename(self.filename_incomplete, self.filename_complete)
+            copy(self.filename_incomplete, self.filename_complete)
+        except OSError as e:
+            print(e)
+
+        if path.isfile(self.filename_complete):
+            try:
+                remove(self.filename_incomplete)
+            except FileExistsError as e:
+                print(e)
+
+class Main:
+    def __init__(self):
+        self.RCF = RCF()
+        self.inputLogLocation = self.RCF.read_config_file("inputLogLocation")
+        self.inputLogLocation2 = self.RCF.read_config_file("inputLogLocation2")
+        self.TemplateLocation = self.RCF.read_config_file("TemplateLocation")
+        self.OrigLocation = self.RCF.read_config_file("OrigLocation")
+        self.outputLocation = self.RCF.read_config_file("outputLocation")
+        self.headerItems = self.RCF.read_config_file("NPFheader")
+        self.debug = self.RCF.read_config_file("debug")
+        self.ccx_header = self.RCF.read_config_file("CCxHeader")
+        self.header_array = [[0] * 2 for i in range(len(self.headerItems))]
+        self.logfile = ""
+        self.TypeTemplateFile = None
+        self.devicecount = 0
+        self.die_x_location = 1
+        self.die_x = 0
+        self.die_y_location = 2
+        self.die_y = 0
+        self.device_serial_location = 3
+        self.device_serial = ""
+        self.HBINLocation = 4
+        self.hbin_name_location = 5
+        self.pf_location = 6
+        self.npf_run_startLocation = 7
+        self.SBINLocation = 8
+        self.SBINnameLocation = 9
+        self.board_id = ""
+        self.board_id_location = 10
+        self.driver_id = ""
+        self.driver_id_location = 11
+        self.result_matrixStart = 12  # +1 from previous definitions
+        self.result_matrix_length = 0
+        self.result_matrix_row = []
+        self.NumberOfParameters = 0
+        self.ccx_functions = []
+        self.LotID = ""
+        self.batch_id = ""
+        self.WaferID = ""
+        self.HBIN = []
+        self.HBINname = []
+        self.SBIN = []
+        self.SBINname = []
+        self.UniqIDvsTestMatrix = []
+        self.PassFail = []
+        # default settings for the column locations
+        self.ccx_timestamp_column = 2
+        self.ccx_board_id_column = 3
+        self.ccx_driver_id_column = 4
+        self.ccx_slot_column = 5
+        self.ccx_unique_id_column = 6
+        self.ccx_data_column = 6
+        self.FORMAT = "UniqID_per_Read"
+        self.missing = ""
+
+    def move2error(self, wr_convert_log, message):
+        error_dir = f"{self.RCF.read_config_file('inputLogLocation')}/{self.RCF.read_config_file('error_log')}"
+        rename(self.logfile, f"{error_dir}/{path.basename(self.logfile)}")
+        message = f"{self.logfile} moved to the ERROR bin."
+        wr_convert_log.create_status_log_file()
+        wr_convert_log.write_status_log_file(message)
+        wr_convert_log.close_status_log_file()
+        return
+
+    def create_npf_header(self):
+        for headerItem in self.headerItems:
+            header_item = self.RCF.read_config_file("NPFheader", headerItem)
+            for headerName in header_item:
+                headerValue = self.RCF.read_config_file("NPFheader", headerItem, headerName)
+                self.header_array[int(headerItem)][0] = headerName
+                if headerName == "OSVersion":
+                    self.header_array[int(headerItem)][1] = self.RCF.read_config_file("about", "ToolVersion")
+                else:
+                    self.header_array[int(headerItem)][1] = headerValue
+
+    def get_header_information_from_template(self, wr_convert_log, ccx_file):
+        rtf = RCF(self.TypeTemplateFile, wr_convert_log, self.RCF, ccx_file)
+        if not rtf.tmpl_ok:
+            return False
+
+        try:
+            self.FORMAT = rtf.read_config_file("FORMAT")
+            if self.FORMAT == "UniqID_per_Read":
+                try:
+                    self.ccx_unique_id_column = rtf.read_config_file("UniqIDColumn")
+                except KeyError:
+                    message = f"ERROR: Missing \"UniqIDColumn\" keyword in the device template " \
+                        f"({self.TypeTemplateFile})."
+                    wr_convert_log.write_status_log_file(message)
+                    wr_convert_log.close_status_log_file()
+                    exit(self.RCF.read_config_file("exit_codes", "ReadTemplate"))
+        except KeyError:
+            message = f"ERROR: Missing \"FORMAT\" keyword in the device template ({self.TypeTemplateFile})."
+            wr_convert_log.write_status_log_file(message)
+            wr_convert_log.close_status_log_file()
+            exit(self.RCF.read_config_file("exit_codes", "ReadTemplate"))
+        try:
+            self.ccx_timestamp_column = rtf.read_config_file("TimeStampColumn")
+        except KeyError:
+            message = f"ERROR: Missing \"TimeStampColumn\" keyword in the device template ({self.TypeTemplateFile})."
+            wr_convert_log.write_status_log_file(message)
+            wr_convert_log.close_status_log_file()
+            exit(self.RCF.read_config_file("exit_codes", "ReadTemplate"))
+        try:
+            self.ccx_board_id_column = rtf.read_config_file("BIDcolumn")
+        except KeyError:
+            message = f"ERROR: Missing \"BIDcolumn\" keyword in the device template ({self.TypeTemplateFile})."
+            wr_convert_log.write_status_log_file(message)
+            wr_convert_log.close_status_log_file()
+            exit(self.RCF.read_config_file("exit_codes", "ReadTemplate"))
+        try:
+            self.ccx_driver_id_column = rtf.read_config_file("DriverIDcolumn")
+        except KeyError:
+            message = f"ERROR: Missing \"DriverIDcolumn\" keyword in the device template ({self.TypeTemplateFile})."
+            wr_convert_log.write_status_log_file(message)
+            wr_convert_log.close_status_log_file()
+            exit(self.RCF.read_config_file("exit_codes", "ReadTemplate"))
+        try:
+            self.ccx_slot_column = rtf.read_config_file("SlotColumn")
+        except KeyError:
+            message = f"ERROR: Missing \"SlotColumn\" keyword in the device template ({self.TypeTemplateFile})."
+            wr_convert_log.write_status_log_file(message)
+            wr_convert_log.close_status_log_file()
+            exit(self.RCF.read_config_file("exit_codes", "ReadTemplate"))
+        try:
+            self.ccx_data_column = rtf.read_config_file("DataColumn")
+        except KeyError:
+            message = f"ERROR: Missing \"DataColumn\" keyword in the device template ({self.TypeTemplateFile})."
+            wr_convert_log.write_status_log_file(message)
+            wr_convert_log.close_status_log_file()
+            exit(self.RCF.read_config_file("exit_codes", "ReadTemplate"))
+
+        # Check if TP template is containing the default mandatory keywords.
+        if not self.check_tp_template(rtf):
+            message = f"ERROR: missing mandatory TP template keywords, moved {ccx_file} to the ERROR directory"
+            self.move2error(wr_convert_log, message)
+            message = f"ERROR: missing mandatory TP template keywords ({self.missing})"
+            wr_convert_log.create_error_log_file()
+            wr_convert_log.write_error_log_file(message)
+            wr_convert_log.close_error_log_file()
+            wr_convert_log.close_convert_log_file()
+            exit(self.RCF.read_config_file("exit_codes", "ReadTemplate"))
+
+        for i in range(0, len(self.header_array)):
+            if self.header_array[i][0] == "TestProgramVersion":
+                self.header_array[i][1] = str(rtf.read_config_file("version"))
+            if self.header_array[i][0] == "Temperature":
+                self.header_array[i][1] = str(rtf.read_config_file("Oven Temperature"))
+            if self.header_array[i][0] == "WaferFab":
+                self.header_array[i][1] = rtf.read_config_file("waferfab")
+            if self.header_array[i][0] == "Process":
+                self.header_array[i][1] = rtf.read_config_file("process")
+            if self.header_array[i][0] == "12NC":
+                self.header_array[i][1] = str(rtf.read_config_file("12NC"))
+            if self.header_array[i][0] == "Package":
+                self.header_array[i][1] = rtf.read_config_file("package")
+            if self.header_array[i][0] == "NumberOfParameters":
+                # Determine the number of tests that will be logged
+                self.ccx_functions = []   # clear list
+                self.NumberOfParameters = 0
+                for Uniq_ID in rtf.read_config_file():
+                    try:
+                        # only use the parts that contain keyword LOCATION
+                        try:
+                            rtf.read_config_file(Uniq_ID, "DATA", "UniqID_LOCATION")
+                        except KeyError:
+                            rtf.read_config_file(Uniq_ID, "DATA", "MASK")
+
+                        self.ccx_functions.append([Uniq_ID, 'FAIL'])
+
+                        try:
+                            if rtf.read_config_file(Uniq_ID, "DATA", "CC_MAX"):
+                                multiply_with = rtf.read_config_file(Uniq_ID, "DATA", "CC_MAX")
+                        except KeyError:
+                            multiply_with = 1
+
+                        for test in rtf.read_config_file(Uniq_ID):
+                            try:
+                                if rtf.read_config_file(Uniq_ID, test, "LOG"):
+                                    try:
+                                        if rtf.read_config_file(Uniq_ID, test, "meaning"):
+                                            try:
+                                                rtf.read_config_file(Uniq_ID, test, "LogAsString")
+                                                self.NumberOfParameters += (1 * multiply_with)
+                                            except KeyError:
+                                                self.NumberOfParameters += \
+                                                    (len(rtf.read_config_file(Uniq_ID, test, "meaning")) * multiply_with)
+                                    except KeyError:
+                                        self.NumberOfParameters += (1 * multiply_with)
+                            except:
+                                pass
+                    except:
+                        pass
+
+                # Add the default unique ID that are meant for instrument data logging.
+                for default_unique_id in self.RCF.read_config_file("Default_Unique_IDs"):
+                    self.ccx_functions.append([default_unique_id, 'FAIL'])
+
+                self.header_array[i][1] = str(self.NumberOfParameters)
+        return True
+
+    @staticmethod
+    def read_timestamp(data):
+        timestamp = ""
+        try:
+            timestamp = strftime("%Y%m%d_%H%M%S", strptime(data, '%m/%d/%Y %I:%M:%S %p'))
+        except:
+            try:
+                timestamp = strftime("%Y%m%d_%H%M%S", strptime(data, '%d/%m/%Y %H:%M:%S'))
+            except:
+                try:
+                    timestamp = strftime("%Y%m%d_%H%M%S", strptime(data, '%Y-%m-%d %H:%M:%S'))
+                except:
+                    message = f"ERROR : timestamp couldn't be determined from {data}"
+
+        return timestamp
+
+    def get_header_information_from_ccx(self, ccx_file, wr_convert_log):
+        # get list of CCx keywords from the config file. These are used as translation towards the NPF header.
+        checkFor = self.ccx_header
+        searchedForHeaderValue = ''
+        start_time = ""
+        StopTime = ""
+        # Use the keywords to find the needed data in the CCx file.
+        with open(ccx_file, 'r', buffering=2**21) as csvfile:
+            data_reader = reader(
+                csvfile,
+                delimiter=",")
+
+            SYSTEM = ""
+            # row is a line in the CCX file.
+            skip = False
+            for row in data_reader:
+                # print(row)
+                if skip:
+                    break
+                # Walk through the keywords
+                for chkFor in sorted(checkFor):
+                    # check if a keyword is present in the read line.
+                    if chkFor in str(row):
+                        # get the needed information from that line.
+                        if chkFor == "Primary Diag":
+                            string_location_start = row[0].find(chkFor)
+                            # get value from array (list) location row[0][start location string]
+                            searchedForHeaderValue = row[0][string_location_start + len(chkFor) + 1:] \
+                                .strip().split(' ', 1)[0]
+                        else:
+                            searchedForHeaderValue = row[0][len(chkFor)+1:].strip().split(' ', 1)[0]
+                        # Save LotID and SystemID information for later use.
+                        if chkFor == "System":
+                            SYSTEM = searchedForHeaderValue
+                            self.WaferID = SYSTEM
+                        if chkFor == "LOTID":
+                            # LOTID = searchedForHeaderValue
+                            self.LotID = searchedForHeaderValue
+                        # search through the NPF header array to fill the correct location.
+                        for i in range(0, len(self.header_array)):
+                            NPFheaderKeyWord = self.RCF.read_config_file("CCxHeader", chkFor)
+                            # determine if returned value is an array (list) or not
+                            if type(NPFheaderKeyWord) in (tuple, list):
+                                # if array, walk trough all keywords.
+                                for NPFheaderKey in NPFheaderKeyWord:
+                                    # write data to the correct NPF header part in the array (list)
+                                    # The LotID must be combined with the SystemID. It is easier to find in Exensio
+                                    if (self.header_array[i][0] == "BatchId") and (self.LotID != "") and (SYSTEM != ""):
+                                        length_system = len(SYSTEM)
+                                        length_lot_id = len(self.LotID)
+                                        total_length_batch_id = length_lot_id + length_system + 1
+                                        maximum_batch_id_length = 32
+
+                                        if length_lot_id >= maximum_batch_id_length:
+                                            self.batch_id = self.LotID[:maximum_batch_id_length]
+                                        elif total_length_batch_id > maximum_batch_id_length:
+                                            remaining_batch_id_length = maximum_batch_id_length - length_lot_id - 1
+                                            if remaining_batch_id_length > 5:
+                                                self.batch_id = f"{self.LotID}_{SYSTEM[(length_system - 5):]}"
+                                            elif remaining_batch_id_length > 4:
+                                                self.batch_id = f"{self.LotID}_{SYSTEM[(length_system - 4):]}"
+                                            else:
+                                                self.batch_id = f"{self.LotID}_" \
+                                                    f"{SYSTEM[(length_system - remaining_batch_id_length):]}"
+                                        else:
+                                            self.batch_id = f"{self.LotID}_{SYSTEM}"
+
+                                        """ Just to be sure that the BatchID is not longer than 32 characters """
+                                        self.batch_id = self.batch_id[:maximum_batch_id_length]
+
+                                        if len(self.batch_id) != len(f"{self.LotID}_{SYSTEM}"):
+                                            message = f"Shortened the BatchID ({self.LotID}_{SYSTEM}) " \
+                                                f"to {self.batch_id}"
+                                            wr_convert_log.write_status_log_file(message)
+
+                                        self.header_array[i][1] = self.batch_id
+                                    elif self.header_array[i][0] == NPFheaderKey:
+                                        self.header_array[i][1] = searchedForHeaderValue
+                                        continue
+                                    if NPFheaderKey == "NumberOfDevices":
+                                        self.devicecount = int(searchedForHeaderValue)
+                                        continue
+                                continue
+                            else:
+                                if self.header_array[i][0] == NPFheaderKeyWord:
+                                    self.header_array[i][1] = searchedForHeaderValue
+                                    continue
+                                if NPFheaderKeyWord == "NumberOfDevices":
+                                    self.devicecount = int(searchedForHeaderValue)
+                                    continue
+                    try:
+                        if start_time == "":
+                            if "Slot" not in row[0]:
+                                start_time = self.read_timestamp(row[self.ccx_timestamp_column])
+                                if start_time != "":
+                                    date_now = time()  # in seconds since Epoch
+                                    date_ccx = mktime(strptime(start_time, '%Y%m%d_%H%M%S'))
+                                    date_diff = (date_ccx - date_now)
+                                    if self.RCF.read_config_file("MaxTimeInFutureInSec") < date_diff:
+                                        return self.RCF.read_config_file("exit_codes", "TimeInFuture")
+                                    skip = True
+                                    break
+                        # else:
+                        #     StopTime = self.read_timestamp(row[self.ccx_timestamp_column])
+                    except:
+                        pass
+
+            # Restart, but onle read the last x lines.
+            csvfile.seek(0)
+            data_reader_tail = reader(
+                csvfile.readlines()[-10:],
+                delimiter=",")
+            for row in data_reader_tail:
+                try:
+                    StopTime = self.read_timestamp(row[self.ccx_timestamp_column])
+                except IndexError:
+                    pass
+
+            message = f"File is [CCx] with LotID [{self.LotID}] and BatchID [{self.batch_id}]"
+            wr_convert_log.write_data_to_convert_log_file(message)
+            wr_convert_log.do_tesla_log(self.LotID, self.batch_id, self.WaferID, ccx_file, "OK", "")
+
+            for i in range(0, len(self.header_array)):
+                if self.header_array[i][0] == "StartTime":
+                    self.header_array[i][1] = start_time
+                if self.header_array[i][0] == "EndTime":
+                    self.header_array[i][1] = StopTime
+
+    def judge_value(self, dut, rtf, uid, test_name, result):
+        try:
+            lower_limit = rtf.read_config_file(uid, test_name, "LL")
+            upper_limit = rtf.read_config_file(uid, test_name, "UL")
+        except KeyError:
+            # As there are no limits set, the result cannot be judged.
+            return 
+
+        if ((float(result) < float(lower_limit))
+            or (float(upper_limit) < float(result))) \
+                and (int(self.HBIN[dut]) == 1):
+            self.PassFail[dut] = "FAIL"
+            self.HBIN[dut] = rtf.read_config_file(uid, "DATA", "HBIN")
+            self.HBINname[dut] = rtf.read_config_file(uid, "DATA", "HBINname")
+            self.SBIN[dut] = rtf.read_config_file(uid, test_name, "SBIN")
+            self.SBINname[dut] = rtf.read_config_file(uid, test_name, "SBINname")
+        elif ((float(lower_limit) < float(result))
+              or (float(result) < float(upper_limit)))\
+                and (int(self.HBIN[dut]) == 1):
+            self.PassFail[dut] = "PASS"
+        return self.HBIN[dut]
+    
+    def fill_resultmatrix_with_value_data(self, result_part_test_name, result_matrix, datastring_counter, value,
+                                          dut_nr, wr_convert_log, default_id=None):
+        if isinstance(value, str):
+            value = value.lstrip()  # remove leading whitespaces
+            value = value.rstrip()  # remove trailing whitespaces
+        splitted_dut_nr = dut_nr.split('_')
+        slot = splitted_dut_nr[0]
+        dut_num = splitted_dut_nr[1]
+
+        # Check if Device_Serial is written.
+
+        if "Device_Serial" in result_part_test_name:
+            if len(splitted_dut_nr) == 2:
+                for i in range(0, len(result_matrix)):
+                    if ((result_matrix[i][self.die_x_location] == slot)
+                        and (result_matrix[i][self.die_y_location] == dut_num)) \
+                        or ((result_matrix[i][self.die_x_location] == int(slot))
+                            and (result_matrix[i][self.die_y_location] == int(dut_num))):
+                        result_matrix[i][self.device_serial_location] = value
+                        break
+            elif len(splitted_dut_nr) == 3:
+                found_dut_location = False
+                for i in range(0, len(result_matrix)):
+                    if result_matrix[i][self.device_serial_location] == "NA":
+                        result_matrix[i][self.die_x_location] = slot
+                        result_matrix[i][self.die_y_location] = dut_num
+                        result_matrix[i][self.device_serial_location] = value
+                        found_dut_location = True
+                        break
+                if not found_dut_location:
+                    new_result_matrix_row = self.result_matrix_row[:]
+                    new_result_matrix_row[self.die_x_location] = splitted_dut_nr[0]
+                    new_result_matrix_row[self.die_y_location] = splitted_dut_nr[1]
+                    new_result_matrix_row[self.device_serial_location] = dut_nr
+                    for i in range(self.result_matrixStart, len(new_result_matrix_row)):
+                        new_result_matrix_row[i] = "NA"
+                    result_matrix.append(new_result_matrix_row)
+                    dut_location = len(result_matrix) - 1
+            else:
+                print(dut_nr, "not possible to write")
+
+        elif "DriverID" in result_part_test_name:
+            for i in range(0, len(result_matrix)):
+                if (result_matrix[i][self.device_serial_location] == dut_nr) \
+                        and (result_matrix[i][self.driver_id_location] == "NA"):
+                    result_matrix[i][self.driver_id_location] = value
+                    break
+        elif "Board ID" in result_part_test_name:
+            for i in range(0, len(result_matrix)):
+                if (result_matrix[i][self.device_serial_location] == dut_nr) \
+                        and (result_matrix[i][self.driver_id_location] == "NA"):
+                    result_matrix[i][self.board_id_location] = value
+                    break
+        else:
+            # Find DUT/TestName coordinate in the result matrix.
+            # Search for the TestName location in the result matrix
+            location_of_test_name = 0
+            for test_name_location in range(0, len(result_matrix[0])):
+                if result_part_test_name == result_matrix[0][test_name_location]:
+                    location_of_test_name = test_name_location
+
+            # Search for DUT location in the result matrix
+            dut_location = 0
+            for dut_i in range(0, len(result_matrix)):
+                # if result_matrix[dut_i][self.device_serial_location] == dut_nr:
+                if (result_matrix[dut_i][self.device_serial_location] == dut_nr) \
+                        or ((len(splitted_dut_nr) == 2)
+                            and (result_matrix[dut_i][self.die_y_location] == dut_num)
+                            and (result_matrix[dut_i][self.die_x_location] == slot)) \
+                        or ((len(splitted_dut_nr) == 2)
+                            and (result_matrix[dut_i][self.die_y_location] == int(dut_num))
+                            and (result_matrix[dut_i][self.die_x_location] == int(slot))):
+                    dut_location = dut_i
+                    break
+
+            if (dut_location == 0) or (location_of_test_name == 0):
+                message = f"fill_resultmatrix_with_value_data 1: dut_location = {dut_location}, " \
+                    f"location_of_test_name = {location_of_test_name}, " \
+                    f"result_part_test_name = {result_part_test_name}, " \
+                    f"value = {value}, " \
+                    f"dut_nr = {dut_nr}"
+                if not self.debug:
+                    self.move2error(wr_convert_log, message)
+                else:
+                    print(message)
+
+                return False
+
+            # Write the test result on the found DUT/TestName coordinate.
+            try:
+                result_matrix[dut_location][location_of_test_name] = value
+            except TypeError as e:
+                message = f"fill_resultmatrix_with_value_data 2: {e} " \
+                    f"dut_location = {dut_location}, " \
+                    f"location_of_test_name = {location_of_test_name}, " \
+                    f"result_part_test_name = {result_part_test_name}, " \
+                    f"value = {value}"
+
+                if not self.debug:
+                    self.move2error(wr_convert_log, message)
+                else:
+                    print(message)
+
+                return False
+
+            # Write PASS/FAIL information
+            result_matrix[dut_location][self.HBINLocation] = self.HBIN[datastring_counter]
+            result_matrix[dut_location][self.hbin_name_location] = self.HBINname[datastring_counter]
+            result_matrix[dut_location][self.SBINLocation] = self.SBIN[datastring_counter]
+            result_matrix[dut_location][self.SBINnameLocation] = f"\"{self.SBINname[datastring_counter]}\""
+            result_matrix[dut_location][self.pf_location] = self.PassFail[datastring_counter]
+            if (location_of_test_name > self.driver_id_location) \
+                    and ((result_matrix[dut_location][self.die_x_location] == slot)
+                         or (result_matrix[dut_location][self.die_x_location] == int(slot)))\
+                    and ((result_matrix[dut_location][self.die_y_location] == dut_num)
+                         or (result_matrix[dut_location][self.die_y_location] == int(dut_num))):
+                result_matrix[dut_location][-1] = "true"
+
+        return result_matrix, True
+
+    def prepare_npf_result_header(self, rtf, result_matrix, x, test_name, unique_id, test_number,
+                                  npf_unit, npf_min, npf_max, channel=0, meaning_value=0, device_state_value=""):
+
+        npf_header, npf_format = self.create_test_name(unique_id, test_name, meaning_value, device_state_value,
+                                                       channel, test_number)
+
+        try:
+            self.RCF.read_config_file("Default_Unique_IDs", unique_id)
+        except KeyError:
+            result_matrix[0][x] = npf_header
+            result_matrix[1][x] = npf_format
+            result_matrix[2][x] = npf_unit
+            result_matrix[3][x] = npf_min
+            result_matrix[4][x] = npf_max
+            x += 1
+        else:
+            try:
+                # execute when the try works.
+                if self.RCF.read_config_file("Default_Unique_IDs", unique_id, "DATA", "concatenate") \
+                        and rtf.read_config_file("board_power_supplies"):
+                    for i in range(0, rtf.read_config_file("board_power_supplies")):
+                        result_matrix[0][x] = f"{npf_header}_{i}"
+                        result_matrix[1][x] = unique_id  # npf_format
+                        try:
+                            for tn in self.RCF.read_config_file("Default_Unique_IDs", unique_id):
+                                if tn != "DATA":
+                                    result_matrix[2][x] = self.RCF.read_config_file("Default_Unique_IDs",
+                                                                                    unique_id,
+                                                                                    tn,
+                                                                                    "unit")
+                                else:
+                                    continue
+                        except KeyError:
+                            result_matrix[2][x] = npf_unit
+                        result_matrix[3][x] = npf_min
+                        result_matrix[4][x] = npf_max
+                        x += 1
+                else:
+                    raise ErrorRaised
+            except (ErrorRaised, KeyError):
+                try:
+                    for tn in self.RCF.read_config_file("Default_Unique_IDs", unique_id):
+                        if tn != "DATA":
+                            counter = 0
+                            unit_list = self.RCF.read_config_file("Default_Unique_IDs", unique_id, tn, "unit")
+                            for default_id_tn in self.RCF.read_config_file("Default_Unique_IDs",
+                                                                           unique_id,
+                                                                           tn,
+                                                                           "testnames"):
+                                result_matrix[0][x] = f"{default_id_tn}_{npf_header}"
+                                result_matrix[1][x] = f"{npf_format}_{counter}"
+                                result_matrix[2][x] = unit_list[counter]
+                                result_matrix[3][x] = npf_min
+                                result_matrix[4][x] = npf_max
+                                x += 1
+                                counter += 1
+                except:
+                    result_matrix[0][x] = npf_header
+                    result_matrix[1][x] = npf_format
+                    result_matrix[2][x] = npf_unit
+                    result_matrix[3][x] = npf_min
+                    result_matrix[4][x] = npf_max
+                    x += 1
+
+
+        return result_matrix, x
+
+    def check_ccx_functions(self, result_matrix, dut_nr, unique_id):
+        return_value = False
+
+        dut_location = 0
+        for i in range(1, len(result_matrix)):
+            if result_matrix[i][self.device_serial_location] == dut_nr:
+                dut_location = i
+                break  # Found Y coordinate in matrix
+
+        if dut_location == 0:
+            return return_value
+
+        test_location = 0
+        for i in range(0, len(result_matrix[0])):
+            if result_matrix[0][i] is None:
+                break  # last test name was reached in the previous run
+            elif result_matrix[0][i] == "NA":
+                break  # last test name was reached in the previous run
+            # check if one of the following is true
+            # result_matrix[0][i] == <test_name>_<unique_id>_<default_id_followup>
+            if (str(unique_id) in result_matrix[0][i]) and (result_matrix[dut_location][i] != "NA"):
+                return_value = True
+                break
+
+        return return_value
+
+    def reset_ccx_functions(self, unique_id, pass_fail, mode="single"):
+        id_counter = 0
+        if mode == "single":
+            for uid in self.ccx_functions:
+                if uid[0] == unique_id:
+                    self.ccx_functions[id_counter][1] = pass_fail
+                id_counter += 1
+        else:
+            for uid in self.ccx_functions:
+                self.ccx_functions[id_counter][1] = pass_fail
+                id_counter += 1
+
+    def merge_results(self, result_matrix, rtf):
+        # Search for testnames for which the result should be merged with that of another.
+        for i in range(len(self.UniqIDvsTestMatrix)):
+            for testname_key in self.UniqIDvsTestMatrix[i]:
+                if testname_key == 0:
+                    break
+                merge_string = ""
+                string_merge_with = ""
+                string_merge_add = ""
+                unique_id = ""
+                for unique_id_list in self.ccx_functions:
+                    try:
+                        string_merge_with = rtf.read_config_file(unique_id_list[0], testname_key, "StringMergeWith")
+                        string_merge_add = testname_key
+                        merge_string = rtf.read_config_file(unique_id_list[0], testname_key, "MergeString")
+                        unique_id = unique_id_list[0]
+                        break
+                    except:
+                        pass
+
+                if string_merge_with != "":
+                    y_location_merge_with = 0
+                    y_location_merge_add = 0
+                    for j in range(0, len(result_matrix[0])):
+                        if result_matrix[0][j] is None:
+                            break
+                        elif result_matrix[0][j] == "NA":
+                            break
+
+                        if (result_matrix[0][j].startswith(string_merge_with)
+                                and result_matrix[0][j].endswith(f"_{unique_id}"))\
+                                or (f"_{string_merge_with}_" in result_matrix[0][j]
+                                    and result_matrix[0][i].endswith(f"_{unique_id}")):
+                            y_location_merge_with = j
+                        elif(result_matrix[0][j].startswith(string_merge_add)
+                                and result_matrix[0][j].endswith(f"_{unique_id}"))\
+                                or (str(f"_{string_merge_add}_") in result_matrix[0][j]
+                                    and result_matrix[0][j].endswith(f"_{unique_id}")):
+                            y_location_merge_add = j
+
+                    for DUT in range(1, len(result_matrix)):
+                        if (result_matrix[DUT][y_location_merge_with] == "NA") \
+                                or (result_matrix[DUT][y_location_merge_add] == "NA"):
+                            continue
+
+                        if isinstance(result_matrix[DUT][y_location_merge_with], float):
+                            pro_string = str(int(result_matrix[DUT][y_location_merge_with])).zfill(2)
+                        else:
+                            pro_string = result_matrix[DUT][y_location_merge_with]
+                        if isinstance(result_matrix[DUT][y_location_merge_add], float):
+                            post_string = str(int(result_matrix[DUT][y_location_merge_add])).zfill(2)
+                        else:
+                            post_string = result_matrix[DUT][y_location_merge_add]
+
+                        if pro_string.rstrip('"') not in str(result_matrix[DUT][y_location_merge_add]):
+                            pro_string = pro_string.strip('"')
+                            post_string = post_string.strip('"')
+                            merged_strings = f"\"{pro_string}{merge_string}{post_string}\""
+                            result_matrix[DUT][y_location_merge_add] = merged_strings
+
+        return
+
+    def ready_for_writing2npflog(self, write, result_matrix, rtf):
+        # Check if measurement values should be merged
+        self.merge_results(result_matrix, rtf)
+
+        # Write the resultMatrix content to the NPF file
+        for DUT in range(1, len(result_matrix)):
+            if result_matrix[DUT][-1] != "true":
+                continue  # Skip as current line doesn't contain test data that needs to be writen to the NPF file.
+            elif result_matrix[DUT][1] is None:
+                continue  # Skip as current line is corrupt.
+            elif result_matrix[DUT][self.device_serial_location] == "NA":
+                continue  # Skip as no device number is present
+
+            # Only write the number of columns that have useful data.
+            # So, the same amount as what was already written when the result header was written.
+            write.write_result_value(result_matrix[DUT][:self.result_matrix_length])
+            # Reset bin info
+            try:
+                self.HBIN[DUT] = 1
+                self.HBINname[DUT] = "PASS"
+                self.SBIN[DUT] = 1
+                self.SBINname[DUT] = "PASS"
+                self.PassFail[DUT] = "PASS"
+            except IndexError:
+                pass
+
+    def clear_result_matrix(self, result_matrix, max_number_of_devices):
+        for i in range(1, len(result_matrix)):
+            for j in range(0, len(result_matrix[i])):
+                result_matrix[i][j] = "NA"
+
+        # pre fill result_matrix with DieX (slot), DieY (dut) and PASS/FAIL information/settings.
+        slot_number_counter = 1
+        dut_number_counter = 0
+        for j in range(1, len(result_matrix)):
+            dut_number_counter += 1
+            result_matrix[j][self.die_y_location] = dut_number_counter
+            result_matrix[j][self.die_x_location] = slot_number_counter
+            result_matrix[j][self.SBINLocation] = 1
+            result_matrix[j][self.SBINnameLocation] = "\"PASS\""
+            result_matrix[j][self.HBINLocation] = 1
+            result_matrix[j][self.hbin_name_location] = "PASS"
+            result_matrix[j][self.pf_location] = "PASS"
+            result_matrix[j][-1] = "false"
+            if dut_number_counter >= max_number_of_devices:
+                slot_number_counter += 1
+                dut_number_counter = 0
+
+        self.result_matrix_row[self.die_y_location] = dut_number_counter
+        self.result_matrix_row[self.die_x_location] = slot_number_counter
+        self.result_matrix_row[self.SBINLocation] = 1
+        self.result_matrix_row[self.SBINnameLocation] = "\"PASS\""
+        self.result_matrix_row[self.HBINLocation] = 1
+        self.result_matrix_row[self.hbin_name_location] = "PASS"
+        self.result_matrix_row[self.pf_location] = "PASS"
+        self.result_matrix_row[-1] = "false"
+
+        return result_matrix
+
+    def create_test_name(self, unique_id, test, meaning, device_state, channel, test_number=0):
+        # Create test name that should fit the one in the result_matrix
+        # result_part_test_name = [meaning_]<parameter>_[channel_]<Unique identifier>
+        if (meaning != 0) and (channel != 0):
+            test_name = f"{device_state}_{test}_{channel}_{unique_id}"
+            npf_format = f"{channel}{test_number}{meaning}"
+        elif (meaning != 0) and (channel == 0):
+            test_name = f"{device_state}_{test}_{unique_id}"
+            npf_format = f"{test_number}{meaning}"
+        elif (meaning == 0) and (channel != 0):
+            test_name = f"{test}_{channel}_{unique_id}"
+            npf_format = f"{channel}{test_number}"
+        else:
+            test_name = f"{test}_{unique_id}"
+            try:
+                self.RCF.read_config_file("Default_Unique_IDs", unique_id)
+                npf_format = unique_id
+            except KeyError:
+                npf_format = str(test_number)
+
+        return test_name, npf_format
+
+    def judge_and_fill_matrix(self, wr_convert_log, result_matrix, datastring_counter, rtf, unique_id_list, test_name,
+                              value, dut_nr, meaning=0, device_state="", channel=0):
+        result_part_test_name = self.create_test_name(unique_id_list, test_name, meaning, device_state, channel)
+
+        self.judge_value(datastring_counter, rtf, unique_id_list, test_name, value)
+        # Walk through the result_matrix and fill it with device data
+        result_matrix, return_value = self.fill_resultmatrix_with_value_data(result_part_test_name[0], result_matrix,
+                                                                             datastring_counter, value, dut_nr,
+                                                                             wr_convert_log)
+
+        return result_matrix, return_value
+
+    def write_npf_run_start_to_matrix(self, row, result_matrix):
+
+        npf_run_start = self.read_timestamp(row[self.ccx_timestamp_column])
+        if npf_run_start == "":
+            return False
+
+        for i in range(1, len(result_matrix)):
+            if result_matrix[i][self.npf_run_startLocation] == "NA":
+                result_matrix[i][self.npf_run_startLocation] = npf_run_start
+
+        self.result_matrix_row[self.npf_run_startLocation] = npf_run_start
+        return True
+
+    @staticmethod
+    def determine_result_matrix_coordinate(result_matrix, dut, unique_id, test_name, default_id=None):
+        test_location = 0
+        for i in range(0, len(result_matrix[0])):
+            if result_matrix[0][i] is None:
+                break
+            if result_matrix[0][i] == "Na":
+                break
+            # check if one of the following is true
+            # result_matrix[0][i] == <test_name>_<unique_id>
+            # result_matrix[0][i] == <>_<test_name>_<>_<unique_id>
+            #                    == <meaning>_<test_name>_<channel>_<unique_id>
+            if default_id is None \
+                    and (result_matrix[0][i].startswith(test_name)
+                         and result_matrix[0][i].endswith(f"_{unique_id}")) \
+                    or (f"_{test_name}_" in result_matrix[0][i]
+                        and result_matrix[0][i].endswith(f"_{unique_id}")):
+                test_location = i
+            if default_id is not None:
+                # check if one of the following is true
+                # result_matrix[0][i] == <test_name>_<unique_id>_<default_id_followup>
+                if result_matrix[0][i].startswith(test_name) \
+                         and result_matrix[0][i].endswith(f"_{unique_id}_{default_id}"):
+                    test_location = i
+
+        dut_location = 0
+        for i in range(1, len(result_matrix)):
+            if result_matrix[dut_location][3] == dut:
+                dut_location = i
+            if result_matrix[dut_location][test_location] == "NA":
+                break
+
+        return dut_location, test_location
+
+    def handle_default_ids(self, unique_id, row, dut_nr, datastring_counter, result_matrix, max_number_of_devices,
+                           wr_convert_log, rtf):
+        data2process = row[self.ccx_data_column:]
+        slot = row[self.ccx_slot_column]
+        start_location = 1
+        i = 1
+
+        offset = 1
+        if self.RCF.read_config_file("Default_Unique_IDs", unique_id, "DATA", "handle offset"):
+            offset = int(data2process[0].lstrip(unique_id))
+        else:
+            offset = 1
+
+        value = ""
+        value_list = []
+
+        if offset > 1:
+            try:
+                while i < (start_location + offset):
+                    if (data2process[i] == '0') or (data2process[i] == '10'):
+                        value_list.append(value)
+                        value = ""
+                        start_location = start_location + offset
+                        i = start_location
+                        continue
+                    value = value + chr(int(data2process[i]))
+                    i += 1
+            except:
+                pass
+        else:
+            value_list = data2process
+
+        default_unique_id_set = self.RCF.read_config_file("Default_Unique_IDs", unique_id)
+        test_name = ""
+        for tn in default_unique_id_set:
+            if tn != "DATA":
+                test_name = tn
+
+        list_of_testnames = []
+        try:
+            for tn in self.RCF.read_config_file("Default_Unique_IDs", unique_id, test_name, "testnames"):
+                list_of_testnames.append(f"{tn}_{test_name}_{unique_id}")
+            offset = 2
+        except KeyError:
+            pass
+
+        val_lst_new = []
+        for val in value_list:
+            # If needed, translate the temperature
+            val_translated = self.translate_temperature(rtf=rtf, unique_id_list=unique_id, test=test_name, value=val)
+            val_lst_new.append(val_translated)
+        if val_lst_new:
+            value_list = val_lst_new
+
+        if offset > 1:
+            # Write data to the result_matrix.
+            # All values should be addressed per device as the data comes from external supplies/measurement units
+            for i in range(0, len(value_list)):
+                if value_list[i] == "":
+                    continue
+
+                for dut_i in range(1, max_number_of_devices+1):
+                    try:
+                        dut_nr = f"{slot}_{dut_i}"
+                        if len(list_of_testnames) > 0:
+                            result_matrix, return_value = self.fill_resultmatrix_with_value_data(list_of_testnames[i],
+                                                                                                 result_matrix,
+                                                                                                 datastring_counter,
+                                                                                                 value_list[i],
+                                                                                                 dut_nr,
+                                                                                                 wr_convert_log)
+                        else:
+                            test_name_2use = f"{test_name}_{unique_id}_{i}"
+                            result_matrix, return_value = self.fill_resultmatrix_with_value_data(test_name_2use,
+                                                                                                 result_matrix,
+                                                                                                 datastring_counter,
+                                                                                                 value_list[i],
+                                                                                                 dut_nr,
+                                                                                                 wr_convert_log, i)
+                    except IndexError:
+                        break
+
+        else:
+            for i in range(0, max_number_of_devices):
+                try:
+                    dut_nr = f"{slot}_{i+1}"
+                    test_name_2use = f"{test_name}_{unique_id}"
+                    result_matrix, return_value = self.fill_resultmatrix_with_value_data(test_name_2use,
+                                                                                         result_matrix,
+                                                                                         datastring_counter,
+                                                                                         value_list[i],
+                                                                                         dut_nr,
+                                                                                         wr_convert_log)
+                except IndexError:
+                    break
+
+        # Set Board_ID and Driver_ID if they are not set yet.
+        for i in range(0, max_number_of_devices):
+            dut_nr = f"{slot}_{i + 1}"
+            if "\"" not in self.board_id:
+                self.board_id = f"\"{self.board_id}\""
+            result_matrix, return_value = self.fill_resultmatrix_with_value_data("Board ID",
+                                                                                 result_matrix,
+                                                                                 datastring_counter,
+                                                                                 self.board_id,
+                                                                                 dut_nr,
+                                                                                 wr_convert_log)
+            if "\"" not in self.driver_id:
+                self.driver_id = f"\"{self.driver_id}\""
+            result_matrix, return_value = self.fill_resultmatrix_with_value_data("DriverID",
+                                                                                 result_matrix,
+                                                                                 datastring_counter,
+                                                                                 self.driver_id,
+                                                                                 dut_nr,
+                                                                                 wr_convert_log)
+
+        self.reset_ccx_functions(unique_id, "PASS")
+        return result_matrix
+
+    def translate_temperature(self, rtf, unique_id_list, test, value):
+        try:
+            rtf.read_config_file(unique_id_list[0], test, "Kelvin2Celsius")
+        except KeyError:
+            try:
+                self.RCF.read_config_file("Default_Unique_IDs", unique_id_list, test, "Kelvin2Celsius")
+            except:
+                """ No need to translate from Kelvin to Celsius """
+            else:
+                if value:
+                    value = int(value) - 273
+        else:
+            if value:
+                value = value - 273
+
+        return value
+
+    def get_data_information_from_ccx(self, ccx_file, write, wr_convert_log, id_read_method):
+        write.write_result_begin()
+        rtf = RCF(self.TypeTemplateFile, wr_convert_log, self.RCF, ccx_file)
+        if not rtf.tmpl_ok:
+            return False
+
+        self.ccx_timestamp_column = rtf.read_config_file("TimeStampColumn")
+        self.ccx_board_id_column = rtf.read_config_file("BIDcolumn")
+        self.ccx_driver_id_column = rtf.read_config_file("DriverIDcolumn")
+        self.ccx_slot_column = rtf.read_config_file("SlotColumn")
+        self.ccx_data_column = rtf.read_config_file("DataColumn")
+        if id_read_method == "LineID":
+            self.ccx_unique_id_column = rtf.read_config_file("UniqIDColumn")
+
+        # Create matrix that contains the unique id.
+        # So that browsing the template is not needed during the browsing of the log file.
+        self.UniqIDvsTestMatrix = [[0 for i in range(self.NumberOfParameters+2)]
+                                   for j in range(len(self.ccx_functions)+1)]
+        counter_i = 0
+        for unique_id_list in self.ccx_functions:
+            self.UniqIDvsTestMatrix[counter_i][0] = unique_id_list[0]
+            counter_j = 1
+            try:
+                for CCxTest in rtf.read_config_file(unique_id_list[0]):
+                    if CCxTest != "function":
+                        self.UniqIDvsTestMatrix[counter_i][counter_j] = CCxTest
+                        counter_j += 1
+            except:
+                for hardware_data in self.RCF.read_config_file("Default_Unique_IDs", unique_id_list[0]):
+                    if hardware_data == "DATA":
+                        continue
+                    self.UniqIDvsTestMatrix[counter_i][counter_j] = hardware_data
+                counter_j += 1
+            counter_i += 1
+
+        # determine the maximum number of boards (slots).
+        number_of_slots_max = 0
+        try:
+            number_of_slots_max = int(rtf.read_config_file("SLOTS", "MAX_SLOT_COUNT"))
+        except KeyError:
+            message = f"ERROR: Failed to convert file : [{path.basename(ccx_file)}]"
+            wr_convert_log.write_status_log_file(message)
+            wr_convert_log.close_status_log_file()
+            message = f"ERROR: \"MAX_SLOT_COUNT\" is not defined in the device template file " \
+                f"[{path.basename(rtf.config_file)}]"
+            wr_convert_log.do_tesla_log("", "", "", path.basename(ccx_file), "Failed", message)
+            wr_convert_log.create_error_log_file()
+            wr_convert_log.write_error_log_file(message)
+            wr_convert_log.close_error_log_file()
+            exit(self.RCF.read_config_file("exit_codes", "ReadCCx"))
+
+        # determine the maximum number of devices.
+        max_number_of_devices = 0
+        try:
+            real_max_number_of_devices = int(rtf.read_config_file("SLOTS", "MAX_DUTS_PER_SLOT"))
+            max_number_of_devices = real_max_number_of_devices + 2
+        except KeyError:
+            message = "ERROR: Failed to convert file : [" + path.basename(ccx_file) + "]"
+            wr_convert_log.write_status_log_file(message)
+            wr_convert_log.close_status_log_file()
+            message = f"ERROR: \"MAX_DUTS_PER_SLOT\" is not defined in the device template file " \
+                f"[{path.basename(rtf.config_file)}]"
+            wr_convert_log.do_tesla_log("", "", "", path.basename(ccx_file), "Failed", message)
+            wr_convert_log.create_error_log_file()
+            wr_convert_log.write_error_log_file(message)
+            wr_convert_log.close_error_log_file()
+            exit(self.RCF.read_config_file("exit_codes", "ReadCCx"))
+
+        #  Create result_matrix.
+        number_of_devices_max = max_number_of_devices * number_of_slots_max
+        #result_matrix = {}
+        #map(lambda result_matrix: result_matrix[i], ["NA" for i in range(self.NumberOfParameters + self.result_matrixStart + 40)])
+        #for j in range(number_of_devices_max):
+            #result_matrix[j] = list(map(lambda i: "NA" , range(self.NumberOfParameters + self.result_matrixStart + 40)))
+        result_matrix = list(map(lambda j: ["NA" for i in range(self.NumberOfParameters + self.result_matrixStart + 40)] , range(number_of_devices_max)))
+        self.result_matrix_row = list(map(lambda i: "NA" , range(self.NumberOfParameters + self.result_matrixStart + 40)))
+        #self.result_matrix_row = ["NA" for i in range(self.NumberOfParameters + self.result_matrixStart + 40)]
+        # Fill lists with default values
+        for i in range(0, number_of_devices_max):
+            self.HBIN.append(1)
+            self.HBINname.append("PASS")
+            self.SBIN.append(1)
+            self.SBINname.append("PASS")
+            self.PassFail.append("PASS")
+
+        result_matrix = self.clear_result_matrix(result_matrix, max_number_of_devices)
+
+        # Fill the result_matrix with test names.
+        x = self.result_matrixStart  # 0-4 are reserved for default NPF result line values.
+                                     # 5 and 6 are reserved for the BoardID and DriverID
+        for csv_line in self.UniqIDvsTestMatrix:
+            counter = 0
+            uniq_id = ""
+            cc_max = 0
+
+            for t_name in csv_line:
+                if (t_name == 0) or (t_name == "DATA"):
+                    continue    # Saves time, by going to the next row when the current row is finished (0).
+
+                try:
+                    log_test = rtf.read_config_file(uniq_id, t_name, "LOG")
+                except KeyError:
+                    try:
+                        log_test = self.RCF.read_config_file("Default_Unique_IDs", uniq_id, t_name, "LOG")
+                    except KeyError:
+                        log_test = False
+
+                if (counter == 0) and (t_name != 0):
+                    uniq_id = t_name
+                    counter += 1
+
+                    # Check if the keyword "CC_MAX" is known in the template (<UniqID>,<test_name>,DATA,CC_MAX)
+                    try:
+                        cc_max = rtf.read_config_file(uniq_id, "DATA", "CC_MAX")
+                    except:
+                        pass
+                elif (t_name != 0) \
+                        and ("rfu" not in t_name) \
+                        and (t_name != "DATA") \
+                        and (t_name != "DataReverseRead") \
+                        and log_test:
+                            # rfu just filling information of the register
+                            # DATA is no log material as it contains Start address of channel and channel data length.
+                            # if LOG (in template) == true, continue
+                    test_name = t_name
+
+                    try:
+                        unit = rtf.read_config_file(uniq_id, t_name, "unit")
+                    except:
+                        try:
+                            unit = self.RCF.read_config_file("Default_Unique_IDs", uniq_id, t_name, "unit")
+                        except:
+                            unit = "-"
+
+                    try:
+                        lower_limit = rtf.read_config_file(uniq_id, t_name, "LL")
+                        upper_limit = rtf.read_config_file(uniq_id, t_name, "UL")
+                    except:
+                        lower_limit = "NA"
+                        upper_limit = "NA"
+
+                    try:
+                        test_number = rtf.read_config_file(uniq_id, t_name, "test_number")
+                    except:
+                        test_number = 0
+
+                    # Check if the keyword "meaning" is known in the template (<UniqID>,<test_name>,meaning)
+                    # If so, the values are needed to be part of the testnames and it will be handled as flag.
+                    # due to this, each line in the meaning section, gets it's own testname.
+                    meaning_exists = 0
+                    try:
+                        for DeviceState in rtf.read_config_file(uniq_id, t_name, "meaning"):
+                            try:
+                                rtf.read_config_file(uniq_id, t_name, "LogAsString")
+                                # As a string is logged, there is no need to translate the result to flags.
+                                break
+                            except KeyError:
+                                pass
+                            meaning_exists = 1
+                            device_state_value = rtf.read_config_file(uniq_id, t_name, "meaning", DeviceState)
+                            # Skip lines that have no value or have value rfu
+                            if (device_state_value != "") and ("rfu" not in device_state_value):
+                                if cc_max > 0:
+                                    for channel in range(1, cc_max):
+                                        result_matrix, x = self.prepare_npf_result_header(rtf, result_matrix, x, t_name,
+                                                                                          uniq_id, test_number, unit,
+                                                                                          lower_limit, upper_limit,
+                                                                                          channel, DeviceState,
+                                                                                          device_state_value)
+                                else:
+                                    result_matrix, x = self.prepare_npf_result_header(rtf, result_matrix, x, t_name,
+                                                                                      uniq_id, test_number, unit,
+                                                                                      lower_limit, upper_limit, 0,
+                                                                                      DeviceState, device_state_value)
+                    except:
+                        pass
+
+                    if meaning_exists == 0:
+                        if cc_max > 0:
+                            for channel in range(1, cc_max):
+                                result_matrix, x = self.prepare_npf_result_header(rtf, result_matrix, x, t_name,
+                                                                                  uniq_id, test_number, unit,
+                                                                                  lower_limit, upper_limit, channel)
+                        else:
+                            result_matrix, x = self.prepare_npf_result_header(rtf, result_matrix, x, t_name, uniq_id,
+                                                                              test_number, unit, lower_limit,
+                                                                              upper_limit)
+                    else:
+                        meaning_exists = 0
+
+        # Use the created Matrix to write de Result npf_header, npf_format, npf_unit, npf_min and npf_max lines.
+        self.result_matrix_length = write.write_result_header(result_matrix[0])
+        write.write_result_format(result_matrix[1])
+        write.write_result_unit(result_matrix[2])
+        write.write_result_min(result_matrix[3])
+        write.write_result_max(result_matrix[4])
+        # clear the array (lists) for future use
+        result_matrix = self.clear_result_matrix(result_matrix, max_number_of_devices)
+
+        # Use the created Matrix to write de Result Value lines.
+        with open(ccx_file, 'r', buffering=2**21) as csvfile:
+            data_reader = reader(csvfile)
+            row_counter = 0
+            slot_prev = 0
+
+            for row in data_reader:
+                row_counter += 1
+                skip = False    # Introduced to quit multiple loops to save throughput time.
+                datastring_counter = 0
+
+                """ If line starts with 'slot', go to next line. """
+                if (len(row) > 0) and ("Slot" in row[0]):
+                    continue
+
+                # Determine the slot number of the current data that should be processed.
+                # It will be used to fill DieX in the NPF file
+                try:
+                    slot = int(row[self.ccx_slot_column])
+                    if (slot > 0) and (slot < number_of_slots_max):
+                        pass
+                except:
+                    continue  # skip and read next line in the CCx file
+
+                if (slot != slot_prev) and (slot_prev != 0):
+                    self.ready_for_writing2npflog(write, result_matrix, rtf)
+                    # Reset the different variables and lists
+                    result_matrix = self.clear_result_matrix(result_matrix, max_number_of_devices)
+                    self.reset_ccx_functions(unique_id_list[0], "FAIL", "all")
+
+                slot_prev = slot
+
+                # Determine the BoardID (BIB) and DriverID (Driver)
+                # These must be logged as string
+                try:
+                    if (len(str(row[self.ccx_board_id_column])) == 14) \
+                            and (len(str(row[self.ccx_driver_id_column])) == 14):
+                        self.board_id = str(row[self.ccx_board_id_column])
+                        self.driver_id = str(row[self.ccx_driver_id_column])
+                except:
+                    continue  # skip and read next line in the CCx file
+
+                # Determine the timestamp when the current data request round is started.
+                # it Will be used for TimeStamp (Run Start)
+                if not self.write_npf_run_start_to_matrix(row, result_matrix):
+                    message = f"ERROR: CCx line {row_counter} doesn't contain a (valid) timestamp, it will be skipped."
+                    wr_convert_log.create_status_log_file()
+                    wr_convert_log.write_status_log_file(message)
+                    wr_convert_log.close_status_log_file()
+                    continue    # No timestamp present, continue with next line.
+
+                for dut_data in row[self.ccx_data_column:]:
+                    if skip:
+                        continue
+                    if (dut_data == "") or (dut_data is None):
+                        try:
+                            dut_mask = rtf.read_config_file(unique_id_list[0], "DutNum", "MASK")
+                        except KeyError:
+                            datastring_counter += 1
+                        else:
+                            dut_pos = (len(bin(int(dut_mask, 16))) - 1) - str(bin(int(dut_mask, 16))).rindex("1")
+                            datastring_counter = (int(dut_data, 16) & int(dut_mask, 16)) >> dut_pos
+
+                        continue
+
+                    if '\r\n' in dut_data:
+                        break
+                    if all(c in hexdigits for c in dut_data):
+                        try:
+                            dut_mask = rtf.read_config_file(unique_id_list[0], "DutNum", "MASK")
+                        except:
+                            pass
+                            datastring_counter += 1
+                        else:
+                            dut_pos = (len(bin(int(dut_mask, 16))) - 1) - str(bin(int(dut_mask, 16))).rindex("1")
+                            datastring_dut = (int(dut_data, 16) & int(dut_mask, 16)) >> dut_pos
+
+                        # Check if current DUT number fits the expected number of DUTS.
+                        DUTStemplate = int(rtf.read_config_file("SLOTS", "MAX_DUTS_PER_SLOT"))
+                        if datastring_counter > DUTStemplate:
+                            message = f"WARNING: The log line is containing more DUT results ({datastring_counter}) " \
+                                f"in respect to the template ({DUTStemplate}). These devices are skipped."
+                            wr_convert_log.create_error_log_file()
+                            wr_convert_log.write_error_log_file(message)
+                            wr_convert_log.close_error_log_file()
+                            wr_convert_log.do_tesla_log(self.LotID, self.batch_id, self.WaferID,
+                                                        path.basename(ccx_file), "Failed", message)
+                            datastring_counter -= 1
+                            break
+
+                        for unique_id_list in self.ccx_functions:
+                            if skip:
+                                continue
+                            unique_id_value = 0
+                            data_length_lsb = 0
+                            data_length_msb = 0
+                            word_length = 0
+                            switch_msb_lsb = False
+                            mask_wordcount = 0
+                            expected_uid_length = len(unique_id_list[0])
+                            try:
+                                uid_start = int(rtf.read_config_file(unique_id_list[0], "DATA", "UniqID_LOCATION"))
+                                uid_end = uid_start + expected_uid_length
+
+                                if id_read_method == "LineID":
+                                    uid_column_content = row[self.ccx_unique_id_column]
+                                    if len(uid_column_content) != expected_uid_length:
+                                        continue
+                                    unique_id_value = uid_column_content[uid_start:uid_end]
+                                elif id_read_method == "DutID":
+                                    unique_id_value = dut_data[uid_start:uid_end]
+                            except:
+                                # 20200811: ASc: Added the possibility to use a mask as it is more logical
+                                # in respect to pointing the location and calculate the expected length for retrieval.
+                                try:
+                                    id_mask = rtf.read_config_file(unique_id_list[0],
+                                                                   "DATA",
+                                                                   "MASK")
+                                except:
+                                    id_mask = self.RCF.read_config_file("Default_Unique_IDs",
+                                                                        unique_id_list[0],
+                                                                        "DATA",
+                                                                        "MASK")
+
+                                pos = (len(bin(int(id_mask, 16))) - 1) - str(bin(int(id_mask, 16))).rindex("1")
+                                if id_read_method == "LineID":
+                                    uid_column_content = row[self.ccx_unique_id_column]
+                                    """ 
+                                      The read column must start with the UID. 
+                                      So,match the MASK with the received column length.
+                                    """
+                                    uid_column_length = len(uid_column_content)
+                                    if uid_column_length != expected_uid_length:
+                                        correct_length = len(id_mask) - 2 + uid_column_length
+                                        id_mask = id_mask.ljust(correct_length, '0')
+
+                                    try:
+                                        unique_id_value = format((int(uid_column_content, 16) & int(id_mask, 16)) >> pos, 'x')
+                                    except ValueError:
+                                        unique_id_value = uid_column_content
+
+                                else:
+                                    unique_id_value = format((int(dut_data, 16) & int(id_mask, 16)) >> pos, 'x')
+
+                            # 20200904: ASc: check unique_id_value as string as it has the instance of long
+                            # or int in some cases.
+                            if str(unique_id_value) == unique_id_list[0]:
+                                # unique_id_already_used = False
+
+                                DUTdataLength = len(dut_data)
+                                if (DUTdataLength == 0):
+                                    continue
+                                try:
+                                    total_data_length = int(rtf.read_config_file(unique_id_list[0],
+                                                                                 "DATA",
+                                                                                 "TotalDataLength"))
+
+                                    if (total_data_length < DUTdataLength) or (total_data_length > DUTdataLength):
+                                        message = f"WARNING : given TotalDataLength ({total_data_length}) " \
+                                                      f"doesn't match the current data string length ({DUTdataLength})"\
+                                                      f" : {unique_id_list[0]} : datastring will be skipped : {row}"
+                                        wr_convert_log.create_status_log_file()
+                                        wr_convert_log.write_status_log_file(message)
+                                        wr_convert_log.do_tesla_log(self.LotID, self.batch_id, self.WaferID,
+                                                                  path.basename(ccx_file), "Failed", message)
+                                        continue
+                                except:
+                                    try:
+                                        Minimumdata_length = int(rtf.read_config_file(unique_id_list[0],
+                                                                                     "DATA",
+                                                                                     "MinimumDataLength"))
+                                        Maximumdata_length = int(rtf.read_config_file(unique_id_list[0],
+                                                                                     "DATA",
+                                                                                     "MaximumDataLength"))
+                                        if (DUTdataLength < Minimumdata_length) or (DUTdataLength > Maximumdata_length):
+                                            message = f"WARNING : Current data string length ({DUTdataLength}) " \
+                                                f"doesn't match the boundaries ({Minimumdata_length} " \
+                                                f"<= data length <= {Maximumdata_length}) {unique_id_list[0]} : " \
+                                                f"datastring will be skipped"
+                                            wr_convert_log.write_status_log_file(message)
+                                            wr_convert_log.do_tesla_log(self.LotID, self.batch_id, self.WaferID,
+                                                                      path.basename(ccx_file), "Failed", message)
+                                            continue
+                                    except KeyError:
+                                        pass
+
+                                # determine Device_nr (in ExensioYield) / Device_Serial (in NPF)
+                                if self.FORMAT == "DUTinDataString":   # Create Device_Serial
+                                    # 20200811: ASc: As one device can pop-up multiple times on the same log line,
+                                    # the LineItemCount is added to the DUT number.
+                                    # This means that LineItemCount is expected to be present.
+                                    try:
+                                        line_item_count_mask = rtf.read_config_file(unique_id_list[0],
+                                                                                    "LineItemCount",
+                                                                                    "MASK")
+                                    except:
+                                        print("Expected \"LineItemCount\" couldn't be read from the test data.\n" \
+                                              "Please check template and/or CCx logging.")
+
+                                    line_item_count_pos = (len(bin(int(line_item_count_mask, 16))) - 1)\
+                                                        - str(bin(int(line_item_count_mask, 16))).rindex("1")
+                                    line_item_count_value = int((int(dut_data, 16) & int(line_item_count_mask, 16))
+                                                                >> line_item_count_pos)
+
+                                    # 20200811: ASc: As one device can pop-up multiple times on the same log line,
+                                    # the DUT location on the CCx motherboard is read from the dut_data.
+                                    # This means that the DUT information is expected in both the dut_data as in the
+                                    # template.
+                                    try:
+                                        dut_mask = rtf.read_config_file(unique_id_list[0], "DutNum", "MASK")
+                                    except KeyError:
+                                        print("Expected \"DUT\" couldn't be read from the test data.\n" \
+                                              "Please check template and/or CCx logging.")
+                                    else:
+                                        dut_pos = (len(bin(int(dut_mask, 16))) - 1) - str(bin(int(dut_mask, 16))).rindex("1")
+                                        datastring_dut = (int(dut_data, 16) & int(dut_mask, 16)) >> dut_pos
+
+                                    # dut_nr = <slot>_<DUT>_<LineItemCount>
+                                    # 20200903: ASc: new set-up on request of Bob Schippers and approved by
+                                    # Dave van den Hurk
+                                    dut_nr = f"{slot}_{datastring_dut}_{line_item_count_value}"
+                                else:
+                                    # dut_nr = <slot>_<DUT>
+                                    # 20200903: ASc: new set-up on request of Bob Schippers and approved by
+                                    # Dave van den Hurk
+                                    dut_nr = f"{slot}_{datastring_counter}"
+
+                                for dut_location in range(0, len(result_matrix)):
+                                    # 20201208: ASc: Replaced a check on dut_nr (device_serial)
+                                    #                with a check on Die_x and Die_Y as it could happen that the
+                                    #                dut_nr is not yet known in the result_matrix.
+
+                                    dut_nr_list = dut_nr.split('_')
+                                    length_dut_nr_list = len(dut_nr_list)
+                                    if (result_matrix[dut_location][self.die_x_location] == dut_nr_list[0]) \
+                                            and (result_matrix[dut_location][self.die_y_location] == dut_nr_list[1])\
+                                            and (length_dut_nr_list == 2):
+                                        datastring_counter = dut_location
+                                    elif (result_matrix[dut_location][self.die_x_location] == dut_nr_list[0]) \
+                                            and (result_matrix[dut_location][self.die_y_location] == dut_nr_list[1]) \
+                                            and (result_matrix[dut_location][self.device_serial_location] == "NA") \
+                                            and (length_dut_nr_list == 3):
+                                        datastring_counter = dut_location
+
+                                unique_id_already_used = self.check_ccx_functions(result_matrix, dut_nr,
+                                                                                  unique_id_list[0])
+
+                                if unique_id_already_used:
+                                    self.ready_for_writing2npflog(write, result_matrix, rtf)
+                                    # Reset the different variables and lists
+                                    result_matrix = self.clear_result_matrix(result_matrix, max_number_of_devices)
+                                    if not self.write_npf_run_start_to_matrix(row, result_matrix):
+                                        message = f"ERROR: CCx line {{row_counter}} does not contain a (valid) " \
+                                            f"timestamp, it will be skipped."
+                                        wr_convert_log.create_status_log_file()
+                                        wr_convert_log.write_status_log_file(message)
+                                        wr_convert_log.close_status_log_file()
+                                        continue    # not timestamp present, continue with next line
+                                    self.reset_ccx_functions(unique_id_list[0], "FAIL", "all")
+                                    # The current unique_id should be marked PASS to get the logging correct.
+                                    self.reset_ccx_functions(unique_id_list[0], "PASS")
+                                else:
+                                    pass
+
+                                result_matrix, return_value = self.fill_resultmatrix_with_value_data("Device_Serial",
+                                                                                                     result_matrix,
+                                                                                                     datastring_counter,
+                                                                                                     dut_nr, dut_nr,
+                                                                                                     wr_convert_log)
+
+                                if "\"" not in self.board_id:
+                                    self.board_id = f"\"{self.board_id}\""
+                                result_matrix, return_value = self.fill_resultmatrix_with_value_data("Board ID",
+                                                                                                     result_matrix,
+                                                                                                     datastring_counter,
+                                                                                                     self.board_id,
+                                                                                                     dut_nr,
+                                                                                                     wr_convert_log)
+                                if "\"" not in self.driver_id:
+                                    self.driver_id = f"\"{self.driver_id}\""
+                                result_matrix, return_value = self.fill_resultmatrix_with_value_data("DriverID",
+                                                                                                     result_matrix,
+                                                                                                     datastring_counter,
+                                                                                                     self.driver_id,
+                                                                                                     dut_nr,
+                                                                                                     wr_convert_log)
+
+                                try:
+                                    # Check if the unique id is a default one.
+                                    self.RCF.read_config_file("Default_Unique_IDs", unique_id_list[0])
+                                    # Handle the data and add it to the result_matrix
+                                    result_matrix = self.handle_default_ids(unique_id_list[0], row, dut_nr,
+                                                                            datastring_counter, result_matrix,
+                                                                            real_max_number_of_devices, wr_convert_log,
+                                                                            rtf)
+                                    skip = True
+                                    continue    # With next row/line
+                                except KeyError as err:
+                                    # print(f"error: {err}")
+                                    pass
+
+                                for matrix_list in self.UniqIDvsTestMatrix:
+                                    if matrix_list[0] == unique_id_list[0]:
+                                        counter_i = 1
+                                        cc_max = 0
+                                        data_start_org = 0
+                                        data_length_org = 0
+                                        channel_count_start = 0
+
+                                        # Determine if dut_data must be split up over different channels
+                                        for test in matrix_list:
+                                            if test == 0:
+                                                break
+                                            if test == "DATA":
+                                                try:
+                                                    data_start_org = rtf.read_config_file(unique_id_list[0], test,
+                                                                                          "CC_START")
+                                                    data_length_org = rtf.read_config_file(unique_id_list[0],
+                                                                                           test,
+                                                                                           "CC_LENGTH")
+                                                    cc_max = rtf.read_config_file(unique_id_list[0], test, "CC_MAX")
+                                                    word_length = rtf.read_config_file(unique_id_list[0], test,
+                                                                                       "CC_LENGTH")
+                                                    channel_count_start = rtf.read_config_file(unique_id_list[0],
+                                                                                               "DATA",
+                                                                                               "CC_LOCATION")
+                                                except KeyError:
+                                                    pass
+
+                                                try:
+                                                    # Needed for DieID translation.
+                                                    data_start_org = rtf.read_config_file(unique_id_list[0], test,
+                                                                                          "START")
+                                                    mask_wordcount = rtf.read_config_file(unique_id_list[0], test,
+                                                                                          "MASK")
+                                                    data_length_lsb = rtf.read_config_file(unique_id_list[0], test,
+                                                                                           "DataLengthLSB")
+                                                    data_length_msb = rtf.read_config_file(unique_id_list[0], test,
+                                                                                           "DataLengthMSB")
+                                                    # address_length = rtf.read_config_file(unique_id_list[0],
+                                                    #                                       test,
+                                                    #                                       "AddressLength")
+                                                    # num_of_words_length = rtf.read_config_file(unique_id_list[0],
+                                                    #                                            test,
+                                                    #                                            "NumOfWordsLength")
+                                                    word_length = rtf.read_config_file(unique_id_list[0], test,
+                                                                                       "WordLength")
+                                                    # reverse_words = rtf.read_config_file(unique_id_list[0],
+                                                    #                                      test,
+                                                    #                                      "ReverseWords")
+                                                    switch_msb_lsb = rtf.read_config_file(unique_id_list[0], test,
+                                                                                          "SwitchMsbLsb")
+                                                except KeyError:
+                                                    pass
+
+                                        # Start unravelling the data.
+                                        for test in matrix_list:
+                                            # make sure that each run starts with initial values
+                                            data_start = data_start_org
+                                            data_length = data_length_org
+                                            value = None
+                                            test_name = test
+                                            # Skip template sections that will not be part of the NPF log file
+                                            if (test_name == 0) \
+                                                    or (test_name == "DATA") \
+                                                    or (test_name == unique_id_list[0]):
+                                                continue
+
+                                            try:
+                                                value_is_expected_decimal = rtf.read_config_file(unique_id_list[0],
+                                                                                                 test,
+                                                                                                 "IsDecimal")
+                                            except KeyError:
+                                                value_is_expected_decimal = False
+
+                                            try:
+                                                log_as_hexadecimal = rtf.read_config_file(unique_id_list[0], test, 
+                                                                                          "LogAsHexadecimal")
+                                            except KeyError:
+                                                log_as_hexadecimal = False
+
+                                            try:
+                                                if not rtf.read_config_file(unique_id_list[0], test_name, "LOG"):
+                                                    continue
+                                            except KeyError:
+                                                pass
+
+                                            mask = rtf.read_config_file(unique_id_list[0], test_name, "MASK")
+
+                                            if ("5" in mask) or \
+                                                    ("9" in mask) or \
+                                                    ("A" in mask) or \
+                                                    ("B" in mask) or \
+                                                    ("D" in mask):
+                                                message = f"SKIP : mask of {unique_id_list[0]}/{test_name} contains a " \
+                                                    f"bitstream with zeroos and ones. Datastring will be skipped"
+                                                wr_convert_log.write_status_log_file(message)
+                                                continue
+
+                                            POS = (len(bin(int(mask, 16))) - 1) - str(bin(int(mask, 16))).rindex("1")
+
+                                            try:
+                                                # If needed,
+                                                # translate the found integer value to an alphanumeric character.
+                                                if rtf.read_config_file(unique_id_list[0], test_name, "int2alphanum"):
+                                                    try:
+                                                        rtf.read_config_file(unique_id_list[0],
+                                                                             test_name,
+                                                                             "DieID_LookUp_Table")
+                                                    except KeyError:
+                                                        # No translation table is given.
+                                                        # Translate it using the ASCII table
+                                                        value = format((int(dut_data, 16) & int(mask, 16)) >> POS, 'x')
+                                                        decode_hex = getdecoder("hex_codec")
+                                                        value = f"\"{decode_hex(value)[0].decode('utf-8').strip()}\""
+
+                                                # if reverse_words and switch_msb_lsb:
+                                                if switch_msb_lsb:
+                                                    pos_wordcount = (len(bin(int(mask_wordcount, 16))) - 1) \
+                                                          - str(bin(int(mask_wordcount, 16))).rindex("1")
+                                                    if not value_is_expected_decimal:
+                                                        wordcount = (int(dut_data, 16) &
+                                                                     int(mask_wordcount, 16)) >> pos_wordcount
+                                                    else:
+                                                        wordcount = (int(dut_data) &
+                                                                     int(mask_wordcount, 16)) >> pos_wordcount
+
+                                                    data_start = data_start + word_length
+                                                    ListOfWords = []
+                                                    for i in range(0, wordcount):
+                                                        ListOfWords.append(dut_data[data_start:data_start+word_length])
+                                                        data_start += word_length
+                                                    ListOfWords.reverse()
+                                                    NewDataString = ""
+                                                    for word in ListOfWords:
+                                                        WordLSB = word[0:data_length_lsb]
+                                                        WordMSB = word[data_length_lsb:data_length_msb+data_length_lsb]
+                                                        NewDataString += WordMSB + WordLSB
+
+                                                    if not value_is_expected_decimal:
+                                                        if not log_as_hexadecimal:
+                                                            value = (int(NewDataString, 16) & int(mask, 16)) >> POS
+                                                        else:
+                                                            value = "\"" + format(
+                                                                (int(NewDataString, 16) & int(mask, 16)) >> POS,
+                                                                'x') + "\""
+                                                    else:
+                                                        value = (int(NewDataString) & int(mask, 16)) >> POS
+
+                                                    # If needed translate the temperature
+                                                    value = self.translate_temperature(rtf, unique_id_list, test, value)
+
+                                                    # If needed translate the found integer value to an alphanumeric
+                                                    # character.
+                                                    try:
+                                                        if rtf.read_config_file(unique_id_list[0],
+                                                                                test_name,
+                                                                                "int2alphanum"):
+                                                            str_value = "0x%02X" % value
+                                                            value = rtf.read_config_file(unique_id_list[0],
+                                                                                         "DieID_LookUp_Table",
+                                                                                         str_value)
+                                                            if value.isalpha():
+                                                                value = f"\"{value}\""
+                                                    except KeyError:
+                                                        pass
+
+                                                result_matrix, return_value = self.judge_and_fill_matrix(wr_convert_log,
+                                                                                                         result_matrix,
+                                                                                                         datastring_counter,
+                                                                                                         rtf,
+                                                                                                         unique_id_list[0],
+                                                                                                         test_name,
+                                                                                                         value, dut_nr)
+
+                                                if not return_value:
+                                                    return return_value
+                                            except:
+                                                if (data_start > 0) and (word_length > 0) and (cc_max > 0):
+                                                    channel_count = int(dut_data[channel_count_start:
+                                                                                channel_count_start+2], 16)
+                                                    # Start logging per channel
+                                                    for chnnl in range(channel_count):
+                                                        # Make sure the channel number doesn't start at 0
+                                                        channel = chnnl + 1   
+                                                        data_end = data_start+word_length
+                                                        # Prevent getting information that lies beyond what is available
+                                                        if data_end > len(dut_data):
+                                                            break
+                                                        part_dut_data = dut_data[data_start:data_end]
+
+                                                        if not value_is_expected_decimal:
+                                                            if not log_as_hexadecimal:
+                                                                value = float((int(part_dut_data, 16) & int(mask, 16)) 
+                                                                              >> POS)
+                                                            else:
+                                                                value = "\"" + format(
+                                                                    (int(part_dut_data, 16) & int(mask, 16)) >> POS,
+                                                                    'x') + "\""
+                                                        else:
+                                                            value = float((int(part_dut_data) & int(mask, 16)) >> POS)
+
+                                                        # If needed translate the temperature
+                                                        value = self.translate_temperature(rtf, unique_id_list, test, value)
+
+                                                        try:
+                                                            # Check if the test contains a "meaning" section.
+                                                            meaning = rtf.read_config_file(unique_id_list[0], test_name, 
+                                                                                           "meaning")
+
+                                                            #Walk through all flags that are part of the "meaning"
+                                                            # section.
+                                                            for flag_value in meaning:
+                                                                flag = rtf.read_config_file(unique_id_list[0],
+                                                                                          test_name,
+                                                                                          "meaning",
+                                                                                          flag_value)
+                                                                # Skip empty values and rfu values
+                                                                if (flag == "") or ("rfu" in flag):
+                                                                    continue
+
+                                                                str_value = "0x%02X" % value
+                                                                result_value = 0
+                                                                try:
+                                                                    if str_value == str(flag_value):
+                                                                        result_value = 1
+                                                                except:
+                                                                    pass
+
+                                                                result_matrix, return_value = self.judge_and_fill_matrix(
+                                                                    wr_convert_log, result_matrix, datastring_counter,
+                                                                    rtf, unique_id_list[0], test_name, result_value,
+                                                                    dut_nr, flag_value, flag, str(channel))
+                                                                if not return_value:
+                                                                    return return_value
+
+                                                        except:
+                                                            result_matrix, return_value = self.judge_and_fill_matrix(wr_convert_log,
+                                                                                                      result_matrix,
+                                                                                                      datastring_counter,
+                                                                                                      rtf,
+                                                                                                      unique_id_list[0],
+                                                                                                      test_name, value,
+                                                                                                      dut_nr, 0,
+                                                                                                      0, str(channel))
+                                                            if not return_value:
+                                                                return return_value
+
+                                                        data_start = data_end
+                                                else:
+                                                    if id_read_method == "LineID":
+                                                        if not value_is_expected_decimal:
+                                                            if not log_as_hexadecimal:
+                                                                value = float((int(dut_data, 16) & int(mask, 16)) >> POS)
+                                                            else:
+                                                                value = "\"" + format(
+                                                                    (int(dut_data, 16) & int(mask, 16)) >> POS,
+                                                                    'x') + "\""
+                                                        else:
+                                                            value = float((int(dut_data) & int(mask, 16)) >> POS)
+                                                    elif id_read_method == "DutID":
+                                                        try:
+                                                            if not value_is_expected_decimal:
+                                                                if not log_as_hexadecimal:
+                                                                    value = float(
+                                                                        (int(dut_data[uid_end:], 16) & int(mask, 16)) 
+                                                                        >> POS)
+                                                                else:
+                                                                    value = "\"" + format(
+                                                                        (int(dut_data[uid_end:], 16) & int(mask, 16)) 
+                                                                        >> POS,
+                                                                        'x') + "\""
+                                                            else:
+                                                                value = float((int(dut_data[uid_end:]) & int(mask, 16)) 
+                                                                              >> POS)
+                                                        except:
+                                                            # 20200811: ASc: Added for the situation when maskwas
+                                                            # used to determine the UniqID
+                                                            if not value_is_expected_decimal:
+                                                                if not log_as_hexadecimal:
+                                                                    value = float((int(dut_data, 16) & int(mask, 16))
+                                                                                  >> POS)
+                                                                else:
+                                                                    value = "\"" + format(
+                                                                        (int(dut_data, 16) & int(mask, 16)) >> POS,
+                                                                        'x') + "\""
+                                                            else:
+                                                                value = float((int(dut_data) & int(mask, 16)) >> POS)
+
+                                                    # If needed translate the temperature
+                                                    value = self.translate_temperature(rtf, unique_id_list, test, value)
+
+                                                    try:
+                                                        # Check if the value from the CCx file needs a sign and/or
+                                                        # if its needs a recalculation
+                                                        signmask = rtf.read_config_file(unique_id_list[0],
+                                                                                        test_name,
+                                                                                        "SIGN",
+                                                                                        "SIGNMASK")
+                                                        signpos = (len(bin(int(signmask, 16))) - 1) - str(bin(int(signmask, 16))).rindex("1")
+
+                                                        if self.FORMAT == "DUTinDataString":
+                                                            value_sign = (int(dut_data, 16)
+                                                                          & int(signmask, 16)) >> signpos
+                                                        else:
+                                                            value_sign = (int(dut_data[uid_end:], 16)
+                                                                          & int(signmask, 16)) >> signpos
+                                                        try:
+                                                            minsign = rtf.read_config_file(unique_id_list[0],
+                                                                                           test_name, "SIGN", "MIN")
+
+                                                            if value_sign == minsign:
+                                                                try:
+                                                                    minformula = rtf.read_config_file(unique_id_list[0],
+                                                                                                      test_name,
+                                                                                                      "SIGN", 
+                                                                                                      "MINformula")
+                                                                    value = eval(minformula)
+                                                                except KeyError:
+                                                                    value = value * -1
+                                                        except:
+                                                            message = f"ERROR : SIGN block not complete " \
+                                                                f"({unique_id_list[0]}:{test_name})"
+                                                            wr_convert_log.write_status_log_file(message)
+                                                            return
+                                                    except:
+                                                        pass
+
+                                                    try:
+                                                        # Check if the test contains a "meaning" section.
+                                                        meaning = rtf.read_config_file(unique_id_list[0],
+                                                                                       test_name,
+                                                                                       "meaning")
+                                                        try:
+                                                            if rtf.read_config_file(unique_id_list[0],
+                                                                                    test_name,
+                                                                                    "LogAsString"):
+                                                                string_value = "NA"
+                                                                for flag_value in meaning:
+                                                                    if float(int(flag_value, 16)) == value:
+                                                                        flag_v = rtf.read_config_file(unique_id_list[0],
+                                                                                                      test_name,
+                                                                                                      'meaning',
+                                                                                                      flag_value)
+                                                                        string_value = f"\"{flag_v}\""\
+
+                                                                        if string_value == "":
+                                                                            string_value = "NA"
+                                                                        break
+
+                                                                result_matrix, return_value = self.judge_and_fill_matrix(
+                                                                    wr_convert_log, result_matrix, datastring_counter,
+                                                                    rtf, unique_id_list[0], test_name, string_value,
+                                                                    dut_nr)
+                                                                if not return_value:
+                                                                    return return_value
+                                                        except KeyError:
+                                                            # Walk through all flags that are part of the "meaning"
+                                                            # section.
+                                                            for flag_value in meaning:
+                                                                flag = rtf.read_config_file(unique_id_list[0],
+                                                                                            test_name,
+                                                                                            "meaning",
+                                                                                            flag_value)
+                                                                # Skip empty values and rfu values
+                                                                if (flag == "") or ("rfu" in flag):
+                                                                    continue
+
+                                                                str_value = "0x%02X" % value
+                                                                result_value = 0
+                                                                try:
+                                                                    if str_value == str(flag_value):
+                                                                        result_value = 1
+                                                                except:
+                                                                    pass
+
+                                                                result_matrix, return_value = self.judge_and_fill_matrix(
+                                                                    wr_convert_log, result_matrix, datastring_counter,
+                                                                    rtf, unique_id_list[0], test_name, result_value,
+                                                                    dut_nr, flag_value, flag)
+                                                                if not return_value:
+                                                                    return return_value
+
+                                                    except:
+                                                        try:
+                                                            try:
+                                                                Formula = rtf.read_config_file(unique_id_list[0],
+                                                                                               test_name,
+                                                                                               "formula")
+                                                            except:
+                                                                pass
+                                                            else:
+                                                                value = eval(Formula)
+                                                        except:
+                                                            message = f"ERROR : processing the provide formula for " \
+                                                                f"unique ID '{unique_id_list[0]}'"
+                                                            wr_convert_log.write_status_log_file(message)
+                                                            return
+
+                                                        result_matrix, return_value = self.judge_and_fill_matrix(wr_convert_log,
+                                                                                                  result_matrix,
+                                                                                                  datastring_counter,
+                                                                                                  rtf,
+                                                                                                  unique_id_list[0],
+                                                                                                  test_name,
+                                                                                                  value, dut_nr)
+                                                        if not return_value:
+                                                            return return_value
+
+                                            counter_i += 1
+                                continue
+                    else:
+                        datastring_counter += 1
+
+            self.ready_for_writing2npflog(write, result_matrix, rtf)
+            write.write_result_end()
+
+        return True
+
+    @staticmethod
+    def file_age(log_file):
+        # Return the age of the file in seconds
+        return time() - path.getmtime(log_file)
+
+    def check_tp_template(self, rtf):
+        return_value = True
+        self.missing = ""
+        for mainField in self.RCF.read_config_file("TPtemplateMandatory", "main"):
+            try:
+                if mainField == "DATA":
+                    for UniqID in rtf.read_config_file():
+                        # check if UniqID is a hexadecimal string
+                        if all(c in hexdigits for c in UniqID):
+                            for subField in self.RCF.read_config_file("TPtemplateMandatory", mainField):
+                                try:
+                                    rtf.read_config_file(UniqID, mainField, subField)
+                                except KeyError:
+                                    if subField == "TotalDataLength":
+                                        minimum_data_length = False
+                                        maximum_data_length = False
+                                        for key in rtf.read_config_file(UniqID, mainField):
+                                            if key == "MinimumDataLength":
+                                                minimum_data_length = True
+                                            elif key == "MaximumDataLength":
+                                                maximum_data_length = True
+                                            else:
+                                                continue
+                                        if not minimum_data_length and not maximum_data_length:
+                                            self.missing = f"{self.missing} [{UniqID}:{mainField}:" \
+                                                f"MinimumDatalength or MaximumDatalength]"
+                                    else:
+                                        self.missing = f"{self.missing} [{UniqID}:{mainField}:{subField}]"
+                    continue
+
+                if mainField == "tests":
+                    for UniqID in rtf.read_config_file():
+                        if str(UniqID).isdigit():
+                            for test in rtf.read_config_file(UniqID):
+                                if test == "DATA":
+                                    continue
+                                for subField in self.RCF.read_config_file("TPtemplateMandatory", mainField):
+                                    try:
+                                        rtf.read_config_file(UniqID, test, subField)
+                                    except KeyError:
+                                        self.missing = f"{self.missing}[{UniqID}:{test}:{subField}], "
+                    continue
+
+                for subField in self.RCF.read_config_file("TPtemplateMandatory", mainField):
+                    try:
+                        rtf.read_config_file(mainField, subField)
+                    except:
+                        self.missing = f"{self.missing}[{mainField}:{subField}], "
+
+            except:
+                try:
+                    rtf.read_config_file(mainField)
+                except:
+                    self.missing = f"{self.missing}[{mainField}], "
+
+        # If a certain optional keyword is present, it could be that other must be present as well.
+
+        for mainField in self.RCF.read_config_file("TPtemplateOptional", "main"):
+            try:
+                if mainField == "DATA":
+                    for UniqID in rtf.read_config_file():
+                        present = []
+                        #check if UniqID is a hexadecimal string
+                        if all(c in hexdigits for c in UniqID):
+                            for subField in self.RCF.read_config_file("TPtemplateOptional", mainField):
+                                try:
+                                    rtf.read_config_file(UniqID, mainField, subField)
+                                    present.append(subField)
+                                except:
+                                    pass
+                        if len(present) != 0:
+                            if set(self.RCF.read_config_file("TPtemplateOptional", mainField)).difference(present):
+                                MissingKeyWords = set(self.RCF.read_config_file("TPtemplateOptional", mainField)).difference(present)
+                                self.missing = f"{self.missing}[{UniqID}"
+                                for MKW in list(MissingKeyWords):
+                                    self.missing = f"{self.missing}:{MKW}"
+                                    self.missing = f"{self.missing}]"
+                    continue
+            except:
+                try:
+                    rtf.read_config_file(mainField)
+                except:
+                    self.missing = f"{self.missing}[{mainField}], "
+
+        if self.missing != "":
+            return_value = False
+            print("ERROR: missing mandatory TP template keywords (", self.missing, ")")
+
+        return return_value
+
+    def process_ccx_file(self, ccx_file):
+        wr_convert_log = WriteConvertLogFiles(ccx_file)
+
+        # Request the age of the log file.
+        # It should at least be 120 seconds old before starting processing.
+        if not self.debug:
+            if self.file_age(ccx_file) < 120:
+                message = f"File: [{ccx_file}] too young ({self.file_age(ccx_file)} < 120 seconds). No processing"
+                wr_convert_log.write_data_to_convert_log_file(message)
+                wr_convert_log.close_convert_log_file()
+                return "young"
+
+        wr_convert_log.create_status_log_file()
+        message = f"File : [{path.basename(ccx_file)}]"
+        wr_convert_log.write_status_log_file(message)
+
+        error_dir = f"{self.RCF.read_config_file('inputLogLocation')}/{self.RCF.read_config_file('error_log')}"
+        if not path.exists(error_dir):
+            mkdir(error_dir)
+
+        file_extension = str(path.splitext(ccx_file)[-1]).lower()
+        if file_extension != ".ccx":
+            message = f"File {ccx_file} has no CCx-file type. No processing"
+            wr_convert_log.write_data_to_convert_log_file(message)
+            wr_convert_log.close_convert_log_file()
+
+            message = f"File [{path.basename(ccx_file)}] moved to ERROR (Not a CCx file)"
+            self.move2error(wr_convert_log, message)
+            return "error"
+
+        if path.getsize(ccx_file) == 0:
+            message = f"File [{path.basename(ccx_file)}] moved to ERROR (empty file)"
+            self.move2error(wr_convert_log, message)
+            wr_convert_log.do_tesla_log(self.LotID, self.batch_id, self.WaferID, path.basename(ccx_file), "Failed",
+                                        message)
+            return "error"
+
+        max_loop = len(self.ccx_header)
+        ccx_file_check_matrix = [[0 for i in range(2)] for j in range(max_loop)]
+        matrix_counter = 0
+        for Item2Check in self.ccx_header:
+            ccx_file_check_matrix[matrix_counter][0] = Item2Check
+            matrix_counter += 1
+
+        with open(ccx_file, 'r', buffering=2**21) as LogFile:
+            for line in LogFile:
+                if max_loop == 0:
+                    break
+
+                # determine if CCx file is a CCx file
+                for Item2Check in self.ccx_header:
+                    if Item2Check in line:
+                        for CCxKeywordLocation in range(0, len(ccx_file_check_matrix)):
+                            if ccx_file_check_matrix[CCxKeywordLocation][0] == Item2Check:
+                                ccx_file_check_matrix[CCxKeywordLocation][1] = 1
+                        if Item2Check != "Primary Diag":
+                            max_loop -= 1
+                            break
+
+                    # determine template name
+                    if (Item2Check == "Primary Diag") and ("Primary Diag" in line):
+                        string_location_start = line.find(Item2Check)   # get location of "Primary Diag" in the string
+                        # Use slicing to gat a piece from th string, after the "Primary Diag" part.
+                        # Split the remaining string, based on the '.' and use the first location from the created list.
+                        test_program_name = line[string_location_start
+                                                 + len(Item2Check)
+                                                 + 1:].strip().split('.', 1)[0].lower()
+                        # Build the expected template name.
+                        self.TypeTemplateFile = f"{self.TemplateLocation}/{test_program_name}_tmpl.json"
+                        max_loop -= 1
+                        break
+        LogFile.close()
+
+        for CCxKeywordLocation in range(0, len(ccx_file_check_matrix)):
+            if ccx_file_check_matrix[CCxKeywordLocation][1] != 1:
+                # move ccx_file to the ERROR directory.
+                message = f"ERROR: Failed to convert file : [{path.basename(ccx_file)}]"
+                self.move2error(wr_convert_log, message)
+                message = f"ERROR : The CCx file is missing keyword ({ccx_file_check_matrix[CCxKeywordLocation][0]})." \
+                    f" Execution of the file ({ccx_file}) is stopped."
+                wr_convert_log.create_error_log_file()
+                wr_convert_log.write_error_log_file(message)
+                wr_convert_log.close_error_log_file()
+                wr_convert_log.do_tesla_log(self.LotID, self.batch_id, self.WaferID,
+                                          path.basename(ccx_file), "Failed", message)
+                return "error"
+
+        write = WriteNpfFile(ccx_file)
+
+        # Get Header information and write it to the npf file
+        returncode = self.get_header_information_from_ccx(ccx_file, wr_convert_log)
+        if (returncode != 0) and (returncode is not None):
+            if returncode == self.RCF.read_config_file("exit_codes", "TimeInFuture"):
+                message = "ERROR: " + ccx_file + " Has start time in the future."
+            else:
+                message = ccx_file + " has unknown error."
+            wr_convert_log.create_error_log_file()
+            wr_convert_log.write_error_log_file(message)
+            wr_convert_log.close_error_log_file()
+            wr_convert_log.do_tesla_log(self.LotID, self.batch_id, self.WaferID,
+                                      path.basename(ccx_file), "Failed", message)
+            return returncode
+        if not self.get_header_information_from_template(wr_convert_log, ccx_file):
+            return "failed"
+
+        write.write_header_information(self.header_array)
+
+        # Get data information and write it to the npf file
+        # if self.Use_UniqID:
+        if (self.FORMAT == "UniqID_per_DUT") or (self.FORMAT == "DUTinDataString"):
+            ReturnValue = self.get_data_information_from_ccx(ccx_file, write, wr_convert_log, "DutID")
+        elif self.FORMAT == "UniqID_per_Read":
+            ReturnValue = self.get_data_information_from_ccx(ccx_file, write, wr_convert_log, "LineID")
+        else:
+            message = "Template contains unknown FORMAT (%s)" % self.FORMAT
+            wr_convert_log.write_data_to_convert_log_file(message)
+            return "failed"
+
+        if ReturnValue != "failed":
+            message = "Converted data [" + ccx_file + "] to [" + write.filename_incomplete + "]"
+            wr_convert_log.write_data_to_convert_log_file(message)
+        write.close_npf_file()
+        wr_convert_log.close_convert_log_file()
+        wr_convert_log.close_status_log_file()
+
+        return "oke"
+
+    @staticmethod
+    def close_ccx2npf():
+        exit(0)
+
+if __name__ == '__main__':
+    print("Started on:", ctime(time()))
+
+    main = Main()
+
+    # AppMutex.enable()   # make sure that only one instance is active
+
+    main.create_npf_header()
+    for ccx_path, dirs, files in walk(main.inputLogLocation):
+        print(ctime(time()), "\t", ccx_path)
+        if (ccx_path != main.inputLogLocation) and (ccx_path != main.inputLogLocation2):
+            continue
+        for file_2_process in files:
+            print(ctime(time()), "\t", ccx_path, file_2_process)
+
+            if (path.basename(file_2_process)[:4] == ".log") or (path.basename(file_2_process)[:4] == ".nfs"):
+                continue  # These files do not need attention, move to the next file
+
+            if ccx_path == main.inputLogLocation2:
+                main.logfile = f"{main.inputLogLocation2}/{file_2_process}"
+            else:
+                main.logfile = f"{main.inputLogLocation}/{file_2_process}"
+
+            if not path.isfile(main.logfile):
+                print(f"File ({main.logfile}) not found")
+                continue  # File doesn't seem te exist anymore, move to the next file
+
+            if "in_process" in file_2_process:
+                stat_f = stat(main.logfile)
+                age_f = time() - stat_f.st_mtime
+                if age_f >= main.RCF.read_config_file("Maximum age in_process file"):
+                    remove(main.logfile)  # Remove in_process files older than x seconds.
+                continue
+
+            in_process_file = f"{main.logfile}.in_process"
+            if path.isfile(in_process_file):
+                continue  # The CCx file is already in process, move to the next one.
+
+            ip_file = open(in_process_file, 'w', buffering=2**21)
+            ip_file.close()
+
+            ReturnValue = main.process_ccx_file(main.logfile)
+            if ReturnValue == "oke":
+                # move log file to Orig
+                destinationLogFile = main.OrigLocation + "/" + file_2_process
+                if not main.debug:
+                    rename(main.logfile, destinationLogFile)
+                    # gzip the log file in Orig
+                    GzipLogFile = main.OrigLocation + "/" + file_2_process + ".gz"
+                    log_in = open(destinationLogFile, 'rb', buffering=2**21)
+                    gzipped_log_out = gzip.open(GzipLogFile, "wb")
+                    gzipped_log_out.writelines(log_in)
+                    gzipped_log_out.close()
+                    log_in.close()
+                    # remove the CCx file in Orig
+                    if path.isfile(GzipLogFile):
+                        remove(destinationLogFile)
+                    # remove the in_processing file
+                remove(in_process_file)
+            elif ReturnValue == "young":
+                remove(in_process_file)
+            elif ReturnValue == main.RCF.read_config_file("exit_codes", "TimeInFuture"):
+                # move log file to Error
+                destinationLogFile = f"{main.inputLogLocation}/{main.RCF.read_config_file('error_log')}/{file_2_process}"
+                rename(main.logfile, destinationLogFile)
+                # gzip the log file in Error
+                GzipLogFile = f"{destinationLogFile}.gz"
+                log_in = open(destinationLogFile, 'rb', buffering=2**21)
+                gzipped_log_out = gzip.open(GzipLogFile, "wb")
+                gzipped_log_out.writelines(log_in)
+                gzipped_log_out.close()
+                log_in.close()
+                # remove the CCx file in Error
+                if path.isfile(GzipLogFile):
+                    remove(destinationLogFile)
+                # remove the in_processing file
+                remove(in_process_file)
+                continue
+
+    print("Finished on:", ctime(time()))
+    main.close_ccx2npf()
+
+exit(0)
+
